@@ -974,6 +974,49 @@ fn psb_color_mode_data_uses_four_byte_section_length() {
 }
 
 #[test]
+fn psb_image_resources_use_four_byte_section_length() {
+    let mut image_resources = psd_great::image_resources::ImageResources::default();
+    image_resources.icc_profile = Some(vec![1, 2, 3, 4]);
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        image_resources: Some(image_resources),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(
+        &psd,
+        &WriteOptions {
+            psb: Some(true),
+            compress: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(
+        read.image_resources
+            .as_ref()
+            .and_then(|resources| resources.icc_profile.as_deref()),
+        Some(&[1, 2, 3, 4][..])
+    );
+    assert_eq!(read.children.as_ref().map(|children| children.len()), Some(1));
+}
+
+#[test]
 fn psb_rle_roundtrip() {
     let psd = Psd {
         width: 8,

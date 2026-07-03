@@ -468,7 +468,7 @@ fn read_color_mode_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd
 
 /// Read image resources section
 fn read_image_resources<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> Result<()> {
-    reader.read_section(1, reader.large, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         let remaining = reader.bytes_left(end_offset) as usize;
         if remaining > 0 {
             let resources = crate::format::image_resources::read_image_resources(reader, remaining)?;
@@ -487,7 +487,7 @@ fn read_layer_and_mask_info<R: Read + Seek>(
     reader: &mut PsdReader<R>,
     psd: &mut Psd,
 ) -> Result<()> {
-    reader.read_section(1, false, |reader, end_offset| {
+    reader.read_section(1, reader.large, |reader, end_offset| {
         // Read layer info
         if reader.bytes_left(end_offset) > 0 {
             reader.read_section(2, reader.large, |reader, end_offset| {
