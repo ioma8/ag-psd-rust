@@ -2357,14 +2357,7 @@ impl PsdWriter {
         match key {
             "luni" => {
                 if let Some(ref name) = info.name {
-                    temp_writer.write_u32(name.len() as u32)?;
-                    for ch in name.chars() {
-                        temp_writer.write_u16(ch as u16)?;
-                    }
-                    temp_writer.write_u16(0)?;
-                    while temp_writer.offset % 4 != 0 {
-                        temp_writer.write_u8(0)?;
-                    }
+                    temp_writer.write_unicode_string(name)?;
                 }
             }
             "lyid" => {
@@ -3378,51 +3371,19 @@ pub fn read_layer_additional_info<R: Read + Seek>(
         } else {
             reader.read_u32()? as usize
         };
+        let block_start = reader.offset;
         reader.read_additional_info(&key, data_length, &mut info)?;
+
+        // Handlers may under-read; the block length is authoritative.
+        reader.seek_to(block_start + data_length as u64)?;
 
         let consumed = reader.offset.saturating_sub(start_offset);
         if consumed >= length as u64 {
             break;
         }
-
-        let mut aligned = false;
-        let remaining = length as u64 - consumed;
-        if remaining >= 4 {
-            let next = reader.peek_signature()?;
-            if next == "8BIM" || next == "8B64" {
-                aligned = true;
-            }
-        }
-
-        if !aligned {
-            for padding in [1usize, 2, 3] {
-                let consumed = reader.offset.saturating_sub(start_offset);
-                if consumed + padding as u64 > length as u64 {
-                    break;
-                }
-                let pos = reader.offset;
-                reader.skip_bytes(padding)?;
-                let remaining = length as u64 - reader.offset.saturating_sub(start_offset);
-                if remaining >= 4 {
-                    let next = reader.peek_signature()?;
-                    if next == "8BIM" || next == "8B64" {
-                        aligned = true;
-                        break;
-                    }
-                } else {
-                    aligned = true;
-                    break;
-                }
-                reader.seek_to(pos)?;
-            }
-        }
-
-        if !aligned {
-            let consumed = reader.offset.saturating_sub(start_offset);
-            if consumed < length as u64 {
-                reader.skip_bytes((length as u64 - consumed) as usize)?;
-            }
-        }
+        let pad = (4 - (data_length % 4)) % 4;
+        let remaining = (length as u64 - consumed) as usize;
+        reader.skip_bytes(pad.min(remaining))?;
     }
 
     Ok(info)
@@ -3453,7 +3414,6 @@ fn write_tagged_block(
     key: &str,
     data: &[u8],
     large: bool,
-    padding: usize,
 ) -> Result<()> {
     let signature = if tagged_block_uses_u64_length(key, large) {
         "8B64"
@@ -3462,20 +3422,14 @@ fn write_tagged_block(
     };
     writer.write_signature(signature)?;
     writer.write_signature(key)?;
-    let padding_len = if padding > 1 {
-        (padding - (data.len() % padding)) % padding
-    } else {
-        0
-    };
-    let stored_len = data.len() + padding_len;
-
     if signature == "8B64" {
         writer.write_u32(0)?;
     }
-    writer.write_u32(stored_len as u32)?;
+    writer.write_u32(data.len() as u32)?;
     writer.write_bytes(data)?;
-    if padding_len != 0 {
-        writer.write_zeros(padding_len)?;
+    let pad = (4 - (data.len() % 4)) % 4;
+    if pad != 0 {
+        writer.write_zeros(pad)?;
     }
     Ok(())
 }
@@ -3559,13 +3513,13 @@ fn write_additional_info_subset_with_options(
             let key = disk_key(key).to_string();
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(raw) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &raw, large, 4)?;
+                    write_tagged_block(writer, &key, &raw, large)?;
                     continue;
                 }
             }
             if let Some(queue) = modeled_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large, 4)?;
+                    write_tagged_block(writer, &key, &data, large)?;
                 }
             }
         }
@@ -3574,7 +3528,7 @@ fn write_additional_info_subset_with_options(
     for (key, _) in &modeled_blocks {
         if let Some(queue) = modeled_by_key.get_mut(key) {
             while let Some(data) = queue.pop_front() {
-                write_tagged_block(writer, key, &data, large, 4)?;
+                write_tagged_block(writer, key, &data, large)?;
             }
         }
     }
@@ -3584,7 +3538,7 @@ fn write_additional_info_subset_with_options(
         if !emitted_keys.contains(key.as_str()) {
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large, 4)?;
+                    write_tagged_block(writer, &key, &data, large)?;
                 }
             }
         }
@@ -3618,14 +3572,14 @@ pub(crate) fn write_layer_additional_info_with_options(
         let data = adj
             .to_bytes()
             .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
-        write_tagged_block(writer, &adj_key, &data, large, 4)?;
+        write_tagged_block(writer, &adj_key, &data, large)?;
     }
 
     if let Some(ref desc) = info.layer_effects_descriptor {
         let mut lmfx_writer = PsdWriter::new(256);
         lmfx_writer.write_u32(0)?;
         lmfx_writer.write_version_and_descriptor(16, desc)?;
-        write_tagged_block(writer, "lmfx", &lmfx_writer.into_buffer(), large, 4)?;
+        write_tagged_block(writer, "lmfx", &lmfx_writer.into_buffer(), large)?;
     }
 
     Ok(())
@@ -3695,13 +3649,13 @@ pub(crate) fn write_document_additional_info_with_options(
             let key = disk_key(key).to_string();
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(raw) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &raw, large, 4)?;
+                    write_tagged_block(writer, &key, &raw, large)?;
                     continue;
                 }
             }
             if let Some(queue) = modeled_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large, 4)?;
+                    write_tagged_block(writer, &key, &data, large)?;
                 }
             }
         }
@@ -3709,7 +3663,7 @@ pub(crate) fn write_document_additional_info_with_options(
     for (key, _) in &modeled_blocks {
         if let Some(queue) = modeled_by_key.get_mut(key) {
             while let Some(data) = queue.pop_front() {
-                write_tagged_block(writer, key, &data, large, 4)?;
+                write_tagged_block(writer, key, &data, large)?;
             }
         }
     }
@@ -3718,7 +3672,7 @@ pub(crate) fn write_document_additional_info_with_options(
         if !emitted_keys.contains(key.as_str()) {
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large, 4)?;
+                    write_tagged_block(writer, &key, &data, large)?;
                 }
             }
         }
@@ -4490,34 +4444,29 @@ mod tests {
     #[test]
     fn unknown_tagged_block_roundtrips_via_raw_blocks() {
         let mut writer = PsdWriter::new(64);
-        write_tagged_block(&mut writer, "ZZZ1", &[1, 2, 3, 4, 5], false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[1, 2, 3, 4, 5], false).unwrap();
         let bytes = writer.into_buffer();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(u32::from_be_bytes(bytes[8..12].try_into().unwrap()), 5);
+        assert_eq!(&bytes[17..20], &[0, 0, 0]);
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
         let parsed = read_layer_additional_info(&mut reader, bytes.len()).unwrap();
         assert_eq!(parsed.raw_blocks.len(), 1);
         assert_eq!(parsed.raw_blocks[0].key, "ZZZ1");
-        assert_eq!(parsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5, 0]);
+        assert_eq!(parsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5]);
 
         let mut rewritten = PsdWriter::new(64);
         write_layer_additional_info(&mut rewritten, &parsed).unwrap();
-        let rewritten = rewritten.into_buffer();
-        assert_eq!(rewritten, bytes);
-
-        let mut rereader =
-            PsdReader::new(std::io::Cursor::new(rewritten.clone()), Default::default());
-        let reparsed = read_layer_additional_info(&mut rereader, rewritten.len()).unwrap();
-        assert_eq!(reparsed.raw_blocks.len(), 1);
-        assert_eq!(reparsed.raw_blocks[0].key, "ZZZ1");
-        assert_eq!(reparsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5, 0]);
+        assert_eq!(rewritten.into_buffer(), bytes);
     }
 
     #[test]
     fn duplicate_unknown_tagged_blocks_preserve_multiplicity_and_order() {
         let mut writer = PsdWriter::new(128);
-        write_tagged_block(&mut writer, "ZZZ1", &[1], false, 2).unwrap();
-        write_tagged_block(&mut writer, "ZZZ2", &[2], false, 2).unwrap();
-        write_tagged_block(&mut writer, "ZZZ1", &[3], false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[1], false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ2", &[2], false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[3], false).unwrap();
         let bytes = writer.into_buffer();
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
@@ -4533,9 +4482,9 @@ mod tests {
     #[test]
     fn mixed_modeled_and_unknown_tagged_blocks_preserve_original_order() {
         let mut writer = PsdWriter::new(128);
-        write_tagged_block(&mut writer, "ZZZ1", &[9], false, 2).unwrap();
-        write_tagged_block(&mut writer, "lyid", &123u32.to_be_bytes(), false, 2).unwrap();
-        write_tagged_block(&mut writer, "ZZZ2", &[8], false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[9], false).unwrap();
+        write_tagged_block(&mut writer, "lyid", &123u32.to_be_bytes(), false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ2", &[8], false).unwrap();
         let bytes = writer.into_buffer();
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
@@ -4549,7 +4498,7 @@ mod tests {
     }
 
     #[test]
-    fn layer_tagged_blocks_are_even_padded_on_write() {
+    fn layer_tagged_blocks_are_four_byte_padded_on_write() {
         let mut info = LayerAdditionalInfo::default();
         info.raw_blocks.push(RawTaggedBlock {
             key: "ZZZ1".to_string(),
@@ -4566,8 +4515,8 @@ mod tests {
         let bytes = writer.into_buffer();
 
         let mut expected = PsdWriter::new(64);
-        write_tagged_block(&mut expected, "ZZZ1", &[1], false, 2).unwrap();
-        write_tagged_block(&mut expected, "ZZZ2", &[2], false, 2).unwrap();
+        write_tagged_block(&mut expected, "ZZZ1", &[1], false).unwrap();
+        write_tagged_block(&mut expected, "ZZZ2", &[2], false).unwrap();
 
         assert_eq!(bytes, expected.into_buffer());
     }
@@ -5045,7 +4994,8 @@ mod tests {
             .expect("write luni");
         let rewritten = writer.into_buffer();
 
-        assert_eq!(length, original_block.len(), "luni block length changed");
-        assert_eq!(rewritten, original_block, "luni bytes changed after semantic roundtrip");
+        assert_eq!(length, 6, "canonical luni payload length changed");
+        assert_eq!(rewritten, original_block[..length], "luni content changed after semantic roundtrip");
+        assert_eq!(&original_block[length..], &[0, 0], "sample should only differ by legacy terminator");
     }
 }
