@@ -371,6 +371,7 @@ pub struct LinkedFileInfo {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyDescriptorItem {
     pub key_shape_invalidated: Option<bool>,
+    pub key_origin_index: Option<PsdIntCode>,
     pub key_origin_type: Option<PsdIntCode>,
     pub key_origin_resolution: Option<f64>,
     pub key_origin_rrect_radii: Option<RRectRadii>,

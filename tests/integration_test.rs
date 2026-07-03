@@ -23,6 +23,297 @@ fn sample_fixture_paths() -> Vec<PathBuf> {
     entries
 }
 
+fn document_tagged_block_keys(bytes: &[u8]) -> Vec<String> {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut offset = 26usize;
+    let color_mode_len = read_u32(bytes, offset) as usize;
+    offset += 4 + color_mode_len;
+    let image_resources_len = read_u32(bytes, offset) as usize;
+    offset += 4 + image_resources_len;
+    let layer_mask_len = read_u32(bytes, offset) as usize;
+    let layer_mask_start = offset + 4;
+    offset = layer_mask_start;
+
+    let layer_info_len = read_u32(bytes, offset) as usize;
+    let layer_info_start = offset + 4;
+    offset = layer_info_start;
+
+    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
+        as usize;
+    offset += 2;
+
+    let mut channel_payload_bytes = 0usize;
+    for _ in 0..layer_count {
+        offset += 16;
+        let channel_count =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16")) as usize;
+        offset += 2;
+        for _ in 0..channel_count {
+            channel_payload_bytes += read_u32(bytes, offset + 2) as usize;
+            offset += 6;
+        }
+        offset += 12;
+        let extra_len = read_u32(bytes, offset) as usize;
+        offset += 4 + extra_len;
+    }
+
+    offset += channel_payload_bytes;
+    let layer_info_end = layer_info_start + layer_info_len;
+    if offset != layer_info_end {
+        assert!(
+            offset < layer_info_end && layer_info_end - offset <= 3,
+            "layer info payload parsing drifted"
+        );
+        offset = layer_info_end;
+    }
+
+    let global_mask_len = read_u32(bytes, offset) as usize;
+    offset += 4 + global_mask_len;
+
+    let layer_mask_end = layer_mask_start + layer_mask_len;
+    let mut keys = Vec::new();
+    while offset + 12 <= layer_mask_end {
+        let signature = &bytes[offset..offset + 4];
+        if signature != b"8BIM" && signature != b"8B64" {
+            break;
+        }
+        let key = String::from_utf8_lossy(&bytes[offset + 4..offset + 8]).to_string();
+        offset += 8;
+        if signature == b"8B64" {
+            offset += 4;
+        }
+        let data_len = read_u32(bytes, offset) as usize;
+        offset += 4 + data_len;
+        while offset % 4 != 0 {
+            offset += 1;
+        }
+        keys.push(key);
+    }
+
+    keys
+}
+
+fn document_tagged_block_data(bytes: &[u8], key: &str) -> Vec<u8> {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut offset = 26usize;
+    let color_mode_len = read_u32(bytes, offset) as usize;
+    offset += 4 + color_mode_len;
+    let image_resources_len = read_u32(bytes, offset) as usize;
+    offset += 4 + image_resources_len;
+    let layer_mask_len = read_u32(bytes, offset) as usize;
+    let layer_mask_start = offset + 4;
+    offset = layer_mask_start;
+
+    let layer_info_len = read_u32(bytes, offset) as usize;
+    let layer_info_start = offset + 4;
+    offset = layer_info_start;
+
+    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
+        as usize;
+    offset += 2;
+
+    let mut channel_payload_bytes = 0usize;
+    for _ in 0..layer_count {
+        offset += 16;
+        let channel_count =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16")) as usize;
+        offset += 2;
+        for _ in 0..channel_count {
+            channel_payload_bytes += read_u32(bytes, offset + 2) as usize;
+            offset += 6;
+        }
+        offset += 12;
+        let extra_len = read_u32(bytes, offset) as usize;
+        offset += 4 + extra_len;
+    }
+
+    offset += channel_payload_bytes;
+    let layer_info_end = layer_info_start + layer_info_len;
+    if offset != layer_info_end {
+        assert!(
+            offset < layer_info_end && layer_info_end - offset <= 3,
+            "layer info payload parsing drifted"
+        );
+        offset = layer_info_end;
+    }
+
+    let global_mask_len = read_u32(bytes, offset) as usize;
+    offset += 4 + global_mask_len;
+
+    let layer_mask_end = layer_mask_start + layer_mask_len;
+    while offset + 12 <= layer_mask_end {
+        let signature = &bytes[offset..offset + 4];
+        if signature != b"8BIM" && signature != b"8B64" {
+            break;
+        }
+        let current_key = String::from_utf8_lossy(&bytes[offset + 4..offset + 8]).to_string();
+        offset += 8;
+        if signature == b"8B64" {
+            offset += 4;
+        }
+        let data_len = read_u32(bytes, offset) as usize;
+        offset += 4;
+        let data = bytes[offset..offset + data_len].to_vec();
+        offset += data_len;
+        while offset % 4 != 0 {
+            offset += 1;
+        }
+        if current_key == key {
+            return data;
+        }
+    }
+
+    panic!("document tagged block {key} not found");
+}
+
+fn layer_blending_range_lengths(bytes: &[u8]) -> Vec<u32> {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut offset = 26usize;
+    let color_mode_len = read_u32(bytes, offset) as usize;
+    offset += 4 + color_mode_len;
+    let image_resources_len = read_u32(bytes, offset) as usize;
+    offset += 4 + image_resources_len;
+    let _layer_mask_len = read_u32(bytes, offset) as usize;
+    offset += 4;
+
+    let _layer_info_len = read_u32(bytes, offset) as usize;
+    offset += 4;
+
+    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
+        as usize;
+    offset += 2;
+
+    let mut lengths = Vec::with_capacity(layer_count);
+    for _ in 0..layer_count {
+        offset += 16;
+        let channel_count =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16")) as usize;
+        offset += 2 + channel_count * 6 + 12;
+        let extra_len = read_u32(bytes, offset) as usize;
+        offset += 4;
+        let extra_start = offset;
+        let mask_len = read_u32(bytes, offset) as usize;
+        offset += 4 + mask_len;
+        let blend_len = read_u32(bytes, offset);
+        lengths.push(blend_len);
+        offset = extra_start + extra_len;
+    }
+
+    lengths
+}
+
+fn layer_extra_data(bytes: &[u8], layer_index: usize) -> Vec<u8> {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut offset = 26usize;
+    let color_mode_len = read_u32(bytes, offset) as usize;
+    offset += 4 + color_mode_len;
+    let image_resources_len = read_u32(bytes, offset) as usize;
+    offset += 4 + image_resources_len;
+    offset += 4;
+    offset += 4;
+    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
+        as usize;
+    offset += 2;
+    assert!(layer_index < layer_count, "layer index out of bounds");
+
+    for current in 0..layer_count {
+        offset += 16;
+        let channel_count =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16")) as usize;
+        offset += 2 + channel_count * 6 + 12;
+        let extra_len = read_u32(bytes, offset) as usize;
+        offset += 4;
+        let extra = bytes[offset..offset + extra_len].to_vec();
+        if current == layer_index {
+            return extra;
+        }
+        offset += extra_len;
+    }
+
+    unreachable!("layer not found")
+}
+
+fn layer_tagged_block_data(bytes: &[u8], layer_name: &str, key: &str) -> Vec<u8> {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut offset = 26usize;
+    let color_mode_len = read_u32(bytes, offset) as usize;
+    offset += 4 + color_mode_len;
+    let image_resources_len = read_u32(bytes, offset) as usize;
+    offset += 4 + image_resources_len;
+    offset += 4;
+    offset += 4;
+    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
+        as usize;
+    offset += 2;
+
+    for _ in 0..layer_count {
+        offset += 16;
+        let channel_count =
+            u16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("u16")) as usize;
+        offset += 2 + channel_count * 6 + 12;
+        let extra_len = read_u32(bytes, offset) as usize;
+        offset += 4;
+        let extra_start = offset;
+        let mask_len = read_u32(bytes, offset) as usize;
+        offset += 4 + mask_len;
+        let blend_len = read_u32(bytes, offset) as usize;
+        offset += 4 + blend_len;
+        let name_len = bytes[offset] as usize;
+        let name = String::from_utf8_lossy(&bytes[offset + 1..offset + 1 + name_len]).to_string();
+        offset += 1 + name_len;
+        while (offset - extra_start) % 4 != 0 {
+            offset += 1;
+        }
+        while offset + 12 <= extra_start + extra_len {
+            let signature = &bytes[offset..offset + 4];
+            if signature != b"8BIM" && signature != b"8B64" {
+                break;
+            }
+            let block_key = String::from_utf8_lossy(&bytes[offset + 4..offset + 8]).to_string();
+            offset += 8;
+            if signature == b"8B64" {
+                offset += 4;
+            }
+            let data_len = read_u32(bytes, offset) as usize;
+            offset += 4;
+            let data = bytes[offset..offset + data_len].to_vec();
+            offset += data_len;
+            if name == layer_name && block_key == key {
+                return data;
+            }
+        }
+        offset = extra_start + extra_len;
+    }
+
+    panic!("tagged block {key} for layer {layer_name} not found");
+}
+
+fn clear_text_raw_bytes(layers: &mut [Layer]) {
+    for layer in layers {
+        if let Some(text) = layer.additional_info.text.as_mut() {
+            text.raw_bytes = None;
+        }
+        if let Some(children) = layer.children.as_mut() {
+            clear_text_raw_bytes(children);
+        }
+    }
+}
+
 fn layer_mask_semantics(mask: Option<&psd_great::layer::LayerMaskData>) -> Option<(Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<u8>, Option<Vec<u8>>)> {
     mask.map(|mask| {
         (
@@ -43,6 +334,33 @@ fn raw_block_semantics(
         .iter()
         .map(|block| (block.key.clone(), block.data.clone()))
         .collect()
+}
+
+fn is_default_blending_ranges(
+    ranges: &psd_great::layer::LayerBlendingRangesData,
+) -> bool {
+    let default_pair = psd_great::layer::LayerBlendingRangePair {
+        src_black: 0,
+        src_white: 0,
+        dst_black: 255,
+        dst_white: 255,
+    };
+    ranges.composite_gray.as_ref() == Some(&default_pair)
+        && ranges.channels.iter().all(|pair| pair == &default_pair)
+}
+
+fn blending_ranges_semantically_equal(
+    expected: &Option<psd_great::layer::LayerBlendingRangesData>,
+    actual: &Option<psd_great::layer::LayerBlendingRangesData>,
+) -> bool {
+    if expected == actual {
+        return true;
+    }
+
+    matches!(
+        (expected, actual),
+        (None, Some(ranges)) | (Some(ranges), None) if is_default_blending_ranges(ranges)
+    )
 }
 
 fn assert_layers_semantically_equal(expected: &[Layer], actual: &[Layer], strict_order: bool) {
@@ -85,9 +403,11 @@ fn assert_layers_semantically_equal(expected: &[Layer], actual: &[Layer], strict
                 "layer tagged block order mismatch"
             );
         }
-        assert_eq!(
-            actual.blending_ranges_data,
-            expected.blending_ranges_data,
+        assert!(
+            blending_ranges_semantically_equal(
+                &expected.blending_ranges_data,
+                &actual.blending_ranges_data
+            ),
             "layer blending ranges mismatch"
         );
         assert_eq!(
@@ -253,6 +573,240 @@ fn all_sample_psds_remain_semantically_stable_across_multiple_roundtrips() {
         assert_psd_semantically_equal(&psd1, &psd2, false);
         assert_psd_semantically_equal(&psd2, &psd3, true);
     }
+}
+
+#[test]
+fn default_writer_does_not_emit_layer_only_tagged_blocks_at_document_scope() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        image_data: Some(PixelData {
+            data: vec![0x11, 0x22, 0x33, 0xFF],
+            width: 1,
+            height: 1,
+        }),
+        additional_info: additional_info::LayerAdditionalInfo {
+            name: Some("Writer Smoke Test".to_string()),
+            id: Some(99),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let bytes = write_psd(&psd, &WriteOptions::default()).expect("write psd");
+    let doc_keys = document_tagged_block_keys(&bytes);
+
+    assert!(
+        !doc_keys.iter().any(|key| key == "luni" || key == "lyid"),
+        "document scope should not contain layer-only tagged blocks, got {doc_keys:?}"
+    );
+}
+
+#[test]
+fn default_writer_emits_photoshop_style_blending_ranges_for_synthesized_rgb_layers() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![0x11, 0x22, 0x33, 0xFF],
+                width: 1,
+                height: 1,
+            }),
+            additional_info: additional_info::LayerAdditionalInfo {
+                name: Some("Layer 1".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+
+    let bytes = write_psd(&psd, &WriteOptions::default()).expect("write psd");
+    assert_eq!(layer_blending_range_lengths(&bytes), vec![40]);
+}
+
+#[test]
+fn layer_tagged_blocks_use_four_byte_padding_between_entries() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![0x11, 0x22, 0x33, 0xFF],
+                width: 1,
+                height: 1,
+            }),
+            additional_info: additional_info::LayerAdditionalInfo {
+                name: Some("Blue Square".to_string()),
+                id: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+
+    let bytes = write_psd(&psd, &WriteOptions::default()).expect("write psd");
+    let extra = layer_extra_data(&bytes, 0);
+    let pattern = b"8BIMluni\x00\x00\x00\x1c";
+    let luni_offset = extra
+        .windows(pattern.len())
+        .position(|window| window == pattern)
+        .expect("find odd-sized luni block");
+    let lyid_signature = &extra[luni_offset + 12 + 28..luni_offset + 12 + 28 + 4];
+    assert_eq!(lyid_signature, b"8BIM");
+}
+
+#[test]
+fn layer_info_length_is_rounded_up_to_an_even_byte_count() {
+    fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_be_bytes(bytes[offset..offset + 4].try_into().expect("u32"))
+    }
+
+    let mut checked = 0usize;
+    for width in 1..=4usize {
+        for height in 1..=4usize {
+            for include_mask in [false, true] {
+                let mut layer = Layer {
+                    top: Some(0),
+                    left: Some(0),
+                    bottom: Some(height as i32),
+                    right: Some(width as i32),
+                    ..Default::default()
+                };
+                layer.image_data = Some(PixelData {
+                    width,
+                    height,
+                    data: vec![255; width * height * 4],
+                });
+                if include_mask {
+                    layer.additional_info.mask = Some(LayerMaskData {
+                        top: Some(0),
+                        left: Some(0),
+                        bottom: Some(height as i32),
+                        right: Some(width as i32),
+                        image_data: Some(PixelData {
+                            width,
+                            height,
+                            data: vec![255; width * height * 4],
+                        }),
+                        ..Default::default()
+                    });
+                }
+
+                let psd = Psd {
+                    width: width as u32,
+                    height: height as u32,
+                    bits_per_channel: Some(8),
+                    color_mode: Some(ColorMode::RGB),
+                    children: Some(vec![layer]),
+                    global_layer_mask_info: Some(GlobalLayerMaskInfo {
+                        overlay_color_space: 0,
+                        color_space1: 1,
+                        color_space2: 2,
+                        color_space3: 3,
+                        color_space4: 4,
+                        opacity: 255,
+                        kind: 128,
+                    }),
+                    ..Default::default()
+                };
+
+                let bytes = write_psd(&psd, &WriteOptions::default())
+                    .expect("write candidate odd layer info PSD");
+
+                let color_mode_len = read_u32(&bytes, 26) as usize;
+                let image_resources_offset = 30 + color_mode_len;
+                let image_resources_len = read_u32(&bytes, image_resources_offset) as usize;
+                let layer_and_mask_offset = image_resources_offset + 4 + image_resources_len;
+                let layer_info_offset = layer_and_mask_offset + 4;
+                let layer_info_len = read_u32(&bytes, layer_info_offset) as usize;
+                checked += 1;
+                assert_eq!(
+                    layer_info_len % 2,
+                    0,
+                    "layer info length should be rounded up to an even byte count"
+                );
+            }
+        }
+    }
+
+    assert!(checked > 0, "expected to validate at least one PSD candidate");
+}
+
+#[test]
+fn tysh_descriptor_version_is_preserved_on_roundtrip_for_sample_text_layer() {
+    let path = in_repo_sample_fixtures_dir().join("4901393.psd");
+    let original = fs::read(&path).expect("read sample fixture");
+    let original_tysh = layer_tagged_block_data(&original, "Website", "TySh");
+    let original_descriptor_version =
+        u32::from_be_bytes(original_tysh[52..56].try_into().expect("descriptor version"));
+
+    let psd = read_psd(Cursor::new(&original), ReadOptions::default())
+        .unwrap_or_else(|err| panic!("{}: parse failed: {err}", path.display()));
+    let rewritten = write_psd(&psd, &WriteOptions::default())
+        .unwrap_or_else(|err| panic!("{}: write failed: {err}", path.display()));
+    let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
+    let rewritten_descriptor_version =
+        u32::from_be_bytes(rewritten_tysh[52..56].try_into().expect("descriptor version"));
+
+    assert_eq!(original_descriptor_version, 16);
+    assert_eq!(rewritten_descriptor_version, original_descriptor_version);
+    assert_eq!(rewritten_tysh, original_tysh);
+}
+
+#[test]
+fn tysh_semantic_rewrite_preserves_sample_text_layer_bytes() {
+    let path = in_repo_sample_fixtures_dir().join("4901393.psd");
+    let original = fs::read(&path).expect("read sample fixture");
+    let original_tysh = layer_tagged_block_data(&original, "Website", "TySh");
+
+    let mut psd = read_psd(Cursor::new(&original), ReadOptions::default())
+        .unwrap_or_else(|err| panic!("{}: parse failed: {err}", path.display()));
+    clear_text_raw_bytes(
+        psd.children
+            .as_mut()
+            .expect("sample should contain layers")
+            .as_mut_slice(),
+    );
+    let rewritten = write_psd(&psd, &WriteOptions::default())
+        .unwrap_or_else(|err| panic!("{}: write failed: {err}", path.display()));
+    let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
+
+    assert_eq!(rewritten_tysh, original_tysh);
+}
+
+#[test]
+fn existing_txt2_block_is_not_rewritten_on_roundtrip() {
+    let path = in_repo_sample_fixtures_dir().join("4901393.psd");
+    let original = fs::read(&path).expect("read sample fixture");
+    let original_txt2 = document_tagged_block_data(&original, "Txt2");
+
+    let psd = read_psd(Cursor::new(&original), ReadOptions::default())
+        .unwrap_or_else(|err| panic!("{}: parse failed: {err}", path.display()));
+    let rewritten = write_psd(&psd, &WriteOptions::default())
+        .unwrap_or_else(|err| panic!("{}: write failed: {err}", path.display()));
+    let rewritten_txt2 = document_tagged_block_data(&rewritten, "Txt2");
+
+    assert_eq!(rewritten_txt2, original_txt2);
 }
 
 #[test]
@@ -952,7 +1506,8 @@ fn test_canonical_tagged_block_types_are_used_by_layer_additional_info() {
         anti_alias_policy: None,
         placed_layer_type: None,
         transform: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-        warp: None,
+        legacy_warp: None,
+        sold_descriptor: None,
         placed: None,
     };
 
@@ -1495,7 +2050,7 @@ fn additional_info_uses_even_padding_not_four_byte_padding() {
     let bytes = vec![
         b'8', b'B', b'I', b'M', // signature
         b'f', b'c', b'm', b'y', // key
-        0, 0, 0, 1, // length
+        0, 0, 0, 2, // length includes even-byte padding
         7, // payload
         0, // even-byte padding
     ];

@@ -583,7 +583,7 @@ impl PsdWriter {
                 self.write_u16(0)?; // null terminator
             }
             DescriptorValue::ObjectArray { class_id, items } => {
-                self.write_u32(items.len() as u32)?;
+                self.write_u32(16)?;
                 self.write_class_structure("", class_id)?;
                 self.write_u32(items.len() as u32)?;
                 for item in items {
@@ -860,6 +860,38 @@ mod tests {
         match reader.read_ostype("tdta").unwrap() {
             DescriptorValue::DataBytes(d) => assert_eq!(d, data),
             _ => panic!("expected RawData"),
+        }
+    }
+
+    #[test]
+    fn object_array_uses_photoshop_version_prefix() {
+        let value = DescriptorValue::ObjectArray {
+            class_id: "rationalPoint".to_string(),
+            items: vec![ObjectArrayItem {
+                id: "Hrzn".to_string(),
+                item_type: "UnFl".to_string(),
+                u_id: "#Pxl".to_string(),
+                values: vec![1.0, 2.0],
+            }],
+        };
+
+        let mut writer = PsdWriter::new(256);
+        writer.write_signature("ObAr").unwrap();
+        writer.write_ostype(&value).unwrap();
+        let buf = writer.into_buffer();
+
+        assert_eq!(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]), 16);
+
+        let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+        let _ = reader.read_signature().unwrap();
+        match reader.read_ostype("ObAr").unwrap() {
+            DescriptorValue::ObjectArray { class_id, items } => {
+                assert_eq!(class_id, "rationalPoint");
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id, "Hrzn");
+                assert_eq!(items[0].values, vec![1.0, 2.0]);
+            }
+            _ => panic!("expected ObjectArray"),
         }
     }
 }

@@ -440,12 +440,14 @@ pub struct ProtectedFlags {
 /// Text layer data
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextLayerData {
+    pub raw_bytes: Option<Vec<u8>>,
     pub transform: Vec<f64>,
     pub text: String,
     pub text_version: u16,
     pub descriptor_version: u32,
     pub text_data: Option<Descriptor>,
     pub warp_version: u16,
+    pub warp_descriptor_version: u32,
     pub warp_data: Option<Descriptor>,
     pub left: f32,
     pub top: f32,
@@ -527,7 +529,8 @@ pub struct PlacedLayer {
     pub anti_alias_policy: Option<PsdIntCode>,
     pub placed_layer_type: Option<PsdIntCode>,
     pub transform: Vec<f64>,
-    pub warp: Option<Descriptor>,
+    pub legacy_warp: Option<Descriptor>,
+    pub sold_descriptor: Option<Descriptor>,
     pub placed: Option<PsdStringCode>,
 }
 
@@ -975,7 +978,14 @@ impl<R: Read + Seek> PsdReader<R> {
             "fcmy" => info.fcmy = Some(self.read_u8()?),
             "brst" => self.read_blending_restrictions(info, length)?,
             "fxrp" => self.read_reference_point(info)?,
-            "TySh" => self.read_text_layer(info, length)?,
+            "TySh" => {
+                let bytes = self.read_bytes(length)?;
+                let mut sub = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
+                sub.read_text_layer(info, length)?;
+                if let Some(text) = info.text.as_mut() {
+                    text.raw_bytes = Some(bytes);
+                }
+            }
             "SoCo" | "GdFl" | "PtFl" => self.read_vector_fill(info, key)?,
             "vstk" => self.read_vector_stroke(info, length)?,
             "vscg" => self.read_vscg(info, length)?,
@@ -1152,10 +1162,20 @@ impl<R: Read + Seek> PsdReader<R> {
                 info.descriptor_blocks.insert(key.to_string(), descriptor);
             }
             "Txt2" => {
-                let inner_length = self.read_u32()? as usize;
-                let raw = self.read_bytes(inner_length.min(length.saturating_sub(4)))?;
-                let parsed = crate::support::engine_data::parse_engine_data(&raw)
-                    .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
+                let raw = self.read_bytes(length)?;
+                let parsed = crate::support::engine_data::parse_engine_data(&raw).or_else(|_| {
+                    if raw.len() < 4 {
+                        return Err(PsdError::InvalidFormat(
+                            "invalid Txt2 payload".to_string(),
+                        ));
+                    }
+                    let inner_length =
+                        u32::from_be_bytes(raw[..4].try_into().expect("Txt2 inner length")) as usize;
+                    let available = raw.len().saturating_sub(4);
+                    let bounded = inner_length.min(available);
+                    crate::support::engine_data::parse_engine_data(&raw[4..4 + bounded])
+                        .map_err(|e| PsdError::InvalidFormat(e.to_string()))
+                })?;
                 info.text_engine = Some(TextEngineBlock { data: parsed });
             }
             "LMsk" | "Mtrn" | "Mt16" | "Mt32" | "FXid" => {
@@ -1500,12 +1520,6 @@ impl<R: Read + Seek> PsdReader<R> {
         Ok(())
     }
 
-    /// Read unicode layer name (luni)
-    fn read_unicode_layer_name(&mut self, info: &mut LayerAdditionalInfo) -> Result<()> {
-        info.name = Some(self.read_unicode_string()?);
-        Ok(())
-    }
-
     /// Read layer ID (lyid)
     fn read_layer_id(&mut self, info: &mut LayerAdditionalInfo) -> Result<()> {
         info.id = Some(self.read_u32()? as i32);
@@ -1636,6 +1650,15 @@ impl<R: Read + Seek> PsdReader<R> {
         Ok(())
     }
 
+    fn read_unicode_layer_name(&mut self, info: &mut LayerAdditionalInfo) -> Result<()> {
+        let mut name = self.read_unicode_string()?;
+        if name.ends_with('\0') {
+            name.pop();
+        }
+        info.name = Some(name);
+        Ok(())
+    }
+
     /// Read text layer data (TySh)
     fn read_text_layer(&mut self, info: &mut LayerAdditionalInfo, _length: usize) -> Result<()> {
         let version = self.read_i16()?;
@@ -1661,8 +1684,8 @@ impl<R: Read + Seek> PsdReader<R> {
             )));
         }
 
-        // Read text descriptor (with u32 version prefix — matches original behavior)
-        let text_descriptor = self.read_version_and_descriptor()?;
+        let descriptor_version = self.read_u32()?;
+        let text_descriptor = self.read_descriptor_structure()?;
 
         // Read warp version
         let warp_version = self.read_i16()? as u16;
@@ -1673,8 +1696,8 @@ impl<R: Read + Seek> PsdReader<R> {
             )));
         }
 
-        // Read warp descriptor (WITH u32 version prefix = 16)
-        let warp_descriptor = self.read_version_and_descriptor()?;
+        let warp_descriptor_version = self.read_u32()?;
+        let warp_descriptor = self.read_descriptor_structure()?;
 
         // Read bounds
         let left = self.read_f32()?;
@@ -1696,12 +1719,14 @@ impl<R: Read + Seek> PsdReader<R> {
             .unwrap_or_default();
 
         info.text = Some(TextLayerData {
+            raw_bytes: None,
             transform,
             text: text.replace('\r', "\n"),
             text_version,
-            descriptor_version: 1,
+            descriptor_version,
             text_data: Some(text_descriptor),
             warp_version,
+            warp_descriptor_version,
             warp_data: Some(warp_descriptor),
             left,
             top,
@@ -1767,6 +1792,8 @@ impl<R: Read + Seek> PsdReader<R> {
         let disable = flags.contains(VectorMaskFlagsBits::DISABLE);
 
         let mut paths = Vec::new();
+        let mut pending_initial_fill_rule = None;
+        let mut pending_clipboard_bounds = None;
 
         while reader.offset + 26 <= length as u64 {
             let selector = reader.read_u16()?;
@@ -1823,8 +1850,8 @@ impl<R: Read + Seek> PsdReader<R> {
 
                     paths.push(VectorPath {
                         path_type,
-                        initial_fill_rule: None,
-                        clipboard_bounds: None,
+                        initial_fill_rule: pending_initial_fill_rule.take(),
+                        clipboard_bounds: pending_clipboard_bounds.take(),
                         points,
                     });
                 }
@@ -1832,10 +1859,21 @@ impl<R: Read + Seek> PsdReader<R> {
                     reader.skip_bytes(24)?;
                 }
                 7 => {
-                    reader.skip_bytes(24)?;
+                    let top = reader.read_fixed_point_path_32()?;
+                    let left = reader.read_fixed_point_path_32()?;
+                    let bottom = reader.read_fixed_point_path_32()?;
+                    let right = reader.read_fixed_point_path_32()?;
+                    let _resolution = reader.read_fixed_point_path_32()?;
+                    pending_clipboard_bounds = Some(Bounds {
+                        top,
+                        left,
+                        bottom,
+                        right,
+                    });
                 }
                 8 => {
-                    reader.skip_bytes(24)?;
+                    pending_initial_fill_rule = Some(reader.read_u16()?);
+                    reader.skip_bytes(22)?;
                 }
                 _ => {
                     reader.skip_bytes(24)?;
@@ -1880,6 +1918,7 @@ impl<R: Read + Seek> PsdReader<R> {
             };
             key_descriptor_list.push(KeyDescriptorItem {
                 key_shape_invalidated: Self::descriptor_bool(inner, "keyShapeInvalidated"),
+                key_origin_index: Self::descriptor_int(inner, "keyOriginIndex").map(PsdIntCode),
                 key_origin_type: Self::descriptor_int(inner, "keyOriginType").map(PsdIntCode),
                 key_origin_resolution: Self::descriptor_number(inner, "keyOriginResolution"),
                 key_origin_rrect_radii: Self::descriptor_rrect(inner, "keyOriginRRectRadii"),
@@ -1969,7 +2008,8 @@ impl<R: Read + Seek> PsdReader<R> {
             anti_alias_policy: None,
             placed_layer_type: None,
             transform,
-            warp,
+            legacy_warp: warp,
+            sold_descriptor: None,
             placed: None,
         });
 
@@ -1996,16 +2036,24 @@ impl<R: Read + Seek> PsdReader<R> {
             })
             .unwrap_or_default();
 
-        info.placed_layer = Some(PlacedLayer {
-            id,
-            page: None,
-            total_pages: None,
-            anti_alias_policy: None,
-            placed_layer_type: None,
-            transform: Vec::new(),
-            warp: Some(descriptor),
-            placed: None,
-        });
+        if let Some(existing) = info.placed_layer.as_mut() {
+            if existing.id.is_empty() {
+                existing.id = id;
+            }
+            existing.sold_descriptor = Some(descriptor);
+        } else {
+            info.placed_layer = Some(PlacedLayer {
+                id,
+                page: None,
+                total_pages: None,
+                anti_alias_policy: None,
+                placed_layer_type: None,
+                transform: Vec::new(),
+                legacy_warp: None,
+                sold_descriptor: Some(descriptor),
+                placed: None,
+            });
+        }
 
         Ok(())
     }
@@ -2309,7 +2357,14 @@ impl PsdWriter {
         match key {
             "luni" => {
                 if let Some(ref name) = info.name {
-                    temp_writer.write_unicode_string(name)?;
+                    temp_writer.write_u32(name.len() as u32)?;
+                    for ch in name.chars() {
+                        temp_writer.write_u16(ch as u16)?;
+                    }
+                    temp_writer.write_u16(0)?;
+                    while temp_writer.offset % 4 != 0 {
+                        temp_writer.write_u8(0)?;
+                    }
                 }
             }
             "lyid" => {
@@ -2513,23 +2568,29 @@ impl PsdWriter {
             }
             "TySh" => {
                 if let Some(ref text) = info.text {
-                    temp_writer.write_i16(1)?; // version
-                    for &v in &text.transform {
-                        temp_writer.write_f64(v)?;
+                    if let Some(raw) = text.raw_bytes.as_ref() {
+                        temp_writer.write_bytes(raw)?;
+                    } else {
+                        temp_writer.write_i16(1)?; // version
+                        for &v in &text.transform {
+                            temp_writer.write_f64(v)?;
+                        }
+                        temp_writer.write_i16(50)?; // text version
+                        if let Some(ref td) = text.text_data {
+                            temp_writer.write_version_and_descriptor(text.descriptor_version, td)?;
+                        }
+                        temp_writer.write_i16(text.warp_version as i16)?;
+                        if let Some(ref wd) = text.warp_data {
+                            temp_writer.write_version_and_descriptor(
+                                text.warp_descriptor_version,
+                                wd,
+                            )?;
+                        }
+                        temp_writer.write_f32(text.left)?;
+                        temp_writer.write_f32(text.top)?;
+                        temp_writer.write_f32(text.right)?;
+                        temp_writer.write_f32(text.bottom)?;
                     }
-                    temp_writer.write_i16(50)?; // text version
-                    if let Some(ref td) = text.text_data {
-                        temp_writer.write_version_and_descriptor(text.descriptor_version, td)?;
-                    }
-                    temp_writer.write_i16(text.warp_version as i16)?;
-                    if let Some(ref wd) = text.warp_data {
-                        // Warp descriptor has u32 version prefix (16)
-                        temp_writer.write_version_and_descriptor(1, wd)?;
-                    }
-                    temp_writer.write_f32(text.left)?;
-                    temp_writer.write_f32(text.top)?;
-                    temp_writer.write_f32(text.right)?;
-                    temp_writer.write_f32(text.bottom)?;
                 }
             }
             "SoCo" | "GdFl" | "PtFl" => {
@@ -2565,6 +2626,23 @@ impl PsdWriter {
                         flags |= VectorMaskFlagsBits::DISABLE;
                     }
                     temp_writer.write_u32(flags.bits())?;
+                    temp_writer.write_u16(6)?;
+                    temp_writer.write_zeros(24)?;
+                    if let Some(initial_fill_rule) =
+                        vm.paths.first().and_then(|path| path.initial_fill_rule)
+                    {
+                        temp_writer.write_u16(8)?;
+                        temp_writer.write_u16(initial_fill_rule)?;
+                        temp_writer.write_zeros(22)?;
+                    }
+                    if let Some(bounds) = vm.paths.first().and_then(|path| path.clipboard_bounds) {
+                        temp_writer.write_u16(7)?;
+                        temp_writer.write_fixed_point_path_32(bounds.top)?;
+                        temp_writer.write_fixed_point_path_32(bounds.left)?;
+                        temp_writer.write_fixed_point_path_32(bounds.bottom)?;
+                        temp_writer.write_fixed_point_path_32(bounds.right)?;
+                        temp_writer.write_fixed_point_path_32(0.0)?;
+                    }
                     for path in &vm.paths {
                         // Subpath length record
                         let selector = match path.path_type {
@@ -2573,7 +2651,9 @@ impl PsdWriter {
                         };
                         temp_writer.write_u16(selector)?;
                         temp_writer.write_u16(path.points.len() as u16)?;
-                        temp_writer.write_zeros(22)?;
+                        temp_writer.write_u16(1)?;
+                        temp_writer.write_u16(1)?;
+                        temp_writer.write_zeros(18)?;
                         // Bezier knot records
                         for point in &path.points {
                             temp_writer.write_u16(if point.linked { 1 } else { 2 })?;
@@ -2585,42 +2665,78 @@ impl PsdWriter {
                             temp_writer.write_fixed_point_path_32(point.forward.x)?;
                         }
                     }
+                    while temp_writer.offset % 4 != 0 {
+                        temp_writer.write_u8(0)?;
+                    }
                 }
             }
             "vogk" => {
                 if let Some(ref data) = info.vector_origination {
+                    fn write_descriptor_entry(
+                        writer: &mut PsdWriter,
+                        key: &str,
+                        value: &DescriptorValue,
+                    ) -> Result<()> {
+                        let sig = match value {
+                            DescriptorValue::Boolean(_) => "bool",
+                            DescriptorValue::Integer(_) => "long",
+                            DescriptorValue::Double(_) => "doub",
+                            DescriptorValue::Float(_) => "DBL ",
+                            DescriptorValue::Descriptor(_) => "Objc",
+                            DescriptorValue::GlobalObject(_) => "GlbO",
+                            DescriptorValue::List(_) => "VlLs",
+                            DescriptorValue::UnitDouble { .. } => "UntF",
+                            DescriptorValue::UnitFloat { .. } => "UnFl",
+                            DescriptorValue::Text(_) => "TEXT",
+                            DescriptorValue::Enum { .. } => "Enmr",
+                            DescriptorValue::Class { .. } => "type",
+                            DescriptorValue::Reference(_) => "obj ",
+                            DescriptorValue::DataBytes(_) => "tdta",
+                            DescriptorValue::Property(_) => "prop",
+                            DescriptorValue::LargeInteger { .. } => "comp",
+                            DescriptorValue::Alias(_) => "alis",
+                            DescriptorValue::FilePath { .. } => "Pth ",
+                            DescriptorValue::ObjectArray { .. } => "ObAr",
+                        };
+                        writer.write_ascii_string_or_class_id(key)?;
+                        writer.write_signature(sig)?;
+                        writer.write_ostype(value)
+                    }
+
                     temp_writer.write_u32(1)?;
                     temp_writer.write_u32(16)?;
-                    let mut list = Vec::new();
+                    temp_writer.write_class_structure("", "null")?;
+                    temp_writer.write_u32(1)?;
+                    temp_writer.write_ascii_string_or_class_id("keyDescriptorList")?;
+                    temp_writer.write_signature("VlLs")?;
+                    temp_writer.write_u32(data.key_descriptor_list.len() as u32)?;
                     for item in &data.key_descriptor_list {
-                        let mut items = HashMap::new();
+                        temp_writer.write_signature("Objc")?;
+                        temp_writer.write_class_structure("", "null")?;
+                        let mut entries: Vec<(&str, DescriptorValue)> = Vec::new();
                         if let Some(v) = item.key_shape_invalidated {
-                            items.insert(
-                                "keyShapeInvalidated".to_string(),
-                                DescriptorValue::Boolean(v),
-                            );
+                            entries.push(("keyShapeInvalidated", DescriptorValue::Boolean(v)));
+                        }
+                        if let Some(v) = item.key_origin_index {
+                            entries.push(("keyOriginIndex", DescriptorValue::Integer(v.0)));
                         }
                         if let Some(v) = item.key_origin_type {
-                            items
-                                .insert("keyOriginType".to_string(), DescriptorValue::Integer(v.0));
+                            entries.push(("keyOriginType", DescriptorValue::Integer(v.0)));
                         }
                         if let Some(v) = item.key_origin_resolution {
-                            items.insert(
-                                "keyOriginResolution".to_string(),
-                                DescriptorValue::Double(v),
-                            );
+                            entries.push(("keyOriginResolution", DescriptorValue::Double(v)));
                         }
                         if let Some(ref v) = item.key_origin_rrect_radii {
-                            items.insert(
-                                "keyOriginRRectRadii".to_string(),
+                            entries.push((
+                                "keyOriginRRectRadii",
                                 DescriptorValue::Descriptor(Self::descriptor_from_rrect(v)),
-                            );
+                            ));
                         }
                         if let Some(ref v) = item.key_origin_shape_bounding_box {
-                            items.insert(
-                                "keyOriginShapeBBox".to_string(),
+                            entries.push((
+                                "keyOriginShapeBBox",
                                 DescriptorValue::Descriptor(Self::descriptor_from_bounds(v)),
-                            );
+                            ));
                         }
                         if let Some(ref points) = item.key_origin_box_corners {
                             let mut point_values = Vec::new();
@@ -2631,18 +2747,18 @@ impl PsdWriter {
                             let mut point_desc_items = HashMap::new();
                             point_desc_items
                                 .insert("points".to_string(), DescriptorValue::List(point_values));
-                            items.insert(
-                                "keyOriginBoxCorners".to_string(),
+                            entries.push((
+                                "keyOriginBoxCorners",
                                 DescriptorValue::Descriptor(Descriptor {
                                     name: String::new(),
                                     class_id: "null".to_string(),
                                     items: point_desc_items,
                                 }),
-                            );
+                            ));
                         }
                         if let Some(ref transform) = item.transform {
-                            items.insert(
-                                "transform".to_string(),
+                            entries.push((
+                                "transform",
                                 DescriptorValue::List(
                                     transform
                                         .iter()
@@ -2650,21 +2766,13 @@ impl PsdWriter {
                                         .map(DescriptorValue::Double)
                                         .collect(),
                                 ),
-                            );
+                            ));
                         }
-                        list.push(DescriptorValue::Descriptor(Descriptor {
-                            name: String::new(),
-                            class_id: "null".to_string(),
-                            items,
-                        }));
+                        temp_writer.write_u32(entries.len() as u32)?;
+                        for (key, value) in &entries {
+                            write_descriptor_entry(&mut temp_writer, key, value)?;
+                        }
                     }
-                    let mut desc_items = HashMap::new();
-                    desc_items.insert("keyDescriptorList".to_string(), DescriptorValue::List(list));
-                    temp_writer.write_descriptor_structure(&Descriptor {
-                        name: String::new(),
-                        class_id: "null".to_string(),
-                        items: desc_items,
-                    })?;
                 }
             }
             "lrFX" | "lfx2" => {
@@ -2682,6 +2790,103 @@ impl PsdWriter {
             }
             "PlLd" => {
                 if let Some(ref pl) = info.placed_layer {
+                    fn write_legacy_plld_entry(
+                        writer: &mut PsdWriter,
+                        key: &str,
+                        value: &DescriptorValue,
+                    ) -> Result<()> {
+                        writer.write_ascii_string_or_class_id(key)?;
+                        match value {
+                            DescriptorValue::Enum { enum_type, value } => {
+                                writer.write_signature("enum")?;
+                                writer.write_ascii_string_or_class_id(enum_type)?;
+                                writer.write_ascii_string_or_class_id(value)
+                            }
+                            _ => {
+                                let sig = match value {
+                                    DescriptorValue::Boolean(_) => "bool",
+                                    DescriptorValue::Integer(_) => "long",
+                                    DescriptorValue::Double(_) => "doub",
+                                    DescriptorValue::Float(_) => "DBL ",
+                                    DescriptorValue::Descriptor(_) => "Objc",
+                                    DescriptorValue::GlobalObject(_) => "GlbO",
+                                    DescriptorValue::List(_) => "VlLs",
+                                    DescriptorValue::UnitDouble { .. } => "UntF",
+                                    DescriptorValue::UnitFloat { .. } => "UnFl",
+                                    DescriptorValue::Text(_) => "TEXT",
+                                    DescriptorValue::Enum { .. } => unreachable!(),
+                                    DescriptorValue::Class { .. } => "type",
+                                    DescriptorValue::Reference(_) => "obj ",
+                                    DescriptorValue::DataBytes(_) => "tdta",
+                                    DescriptorValue::Property(_) => "prop",
+                                    DescriptorValue::LargeInteger { .. } => "comp",
+                                    DescriptorValue::Alias(_) => "alis",
+                                    DescriptorValue::FilePath { .. } => "Pth ",
+                                    DescriptorValue::ObjectArray { .. } => "ObAr",
+                                };
+                                writer.write_signature(sig)?;
+                                writer.write_ostype(value)
+                            }
+                        }
+                    }
+
+                    fn write_plld_warp_descriptor(
+                        writer: &mut PsdWriter,
+                        desc: &Descriptor,
+                    ) -> Result<()> {
+                        use std::collections::HashSet;
+
+                        writer.write_class_structure(&desc.name, &desc.class_id)?;
+                        let ordered_keys = [
+                            "warpStyle",
+                            "warpValue",
+                            "warpPerspective",
+                            "warpPerspectiveOther",
+                            "warpRotate",
+                            "bounds",
+                            "uOrder",
+                            "vOrder",
+                            "customEnvelopeWarp",
+                        ];
+                        writer.write_u32(desc.items.len() as u32)?;
+                        let mut written = HashSet::new();
+                        for key in ordered_keys {
+                            if let Some(value) = desc.items.get(key) {
+                                written.insert(key);
+                                if key == "bounds" {
+                                    if let DescriptorValue::Descriptor(bounds) = value {
+                                        writer.write_ascii_string_or_class_id(key)?;
+                                        writer.write_signature("Objc")?;
+                                        writer.write_class_structure(&bounds.name, &bounds.class_id)?;
+                                        writer.write_u32(bounds.items.len() as u32)?;
+                                        for bounds_key in ["Top ", "Left", "Btom", "Rght"] {
+                                            if let Some(bounds_value) = bounds.items.get(bounds_key) {
+                                                write_legacy_plld_entry(
+                                                    writer,
+                                                    bounds_key,
+                                                    bounds_value,
+                                                )?;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+                                write_legacy_plld_entry(writer, key, value)?;
+                            }
+                        }
+                        let mut remaining_keys: Vec<_> = desc
+                            .items
+                            .keys()
+                            .filter(|key| !written.contains(key.as_str()))
+                            .collect();
+                        remaining_keys.sort();
+                        for key in remaining_keys {
+                            let value = &desc.items[key];
+                            write_legacy_plld_entry(writer, key, value)?;
+                        }
+                        Ok(())
+                    }
+
                     if pl.transform.is_empty() {
                         return Ok(0);
                     }
@@ -2703,8 +2908,11 @@ impl PsdWriter {
                     temp_writer.write_u32(0)?;
                     temp_writer.write_u32(16)?;
                     // Legacy PlLd stores a raw descriptor here, not version+descriptor.
-                    if let Some(ref warp) = pl.warp {
-                        temp_writer.write_descriptor_structure(warp)?;
+                    if let Some(ref warp) = pl.legacy_warp {
+                        write_plld_warp_descriptor(&mut temp_writer, warp)?;
+                    }
+                    while temp_writer.offset % 4 != 0 {
+                        temp_writer.write_u8(0)?;
                     }
                 }
             }
@@ -2713,8 +2921,10 @@ impl PsdWriter {
                     temp_writer.write_signature("soLD")?;
                     temp_writer.write_u32(4)?;
                     temp_writer.write_u32(16)?;
-                    if let Some(ref warp) = pl.warp {
-                        temp_writer.write_descriptor_structure(warp)?;
+                    if let Some(ref descriptor) =
+                        pl.sold_descriptor.as_ref().or(pl.legacy_warp.as_ref())
+                    {
+                        temp_writer.write_descriptor_structure(descriptor)?;
                     }
                 }
             }
@@ -2940,7 +3150,6 @@ impl PsdWriter {
                 if let Some(ref text_engine) = info.text_engine {
                     let bytes = crate::support::engine_data::serialize_engine_data(&text_engine.data, true)
                         .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
-                    temp_writer.write_u32(bytes.len() as u32)?;
                     temp_writer.write_bytes(&bytes)?;
                 }
             }
@@ -3171,27 +3380,48 @@ pub fn read_layer_additional_info<R: Read + Seek>(
         };
         reader.read_additional_info(&key, data_length, &mut info)?;
 
-        // Most blocks follow even-byte padding. Some real-world files align
-        // these blocks to 4-byte boundaries, so accept both layouts.
-        let even_padding = (2 - (data_length % 2)) % 2;
-        if even_padding != 0 {
-            reader.skip_bytes(even_padding)?;
-        }
         let consumed = reader.offset.saturating_sub(start_offset);
         if consumed >= length as u64 {
             break;
         }
+
+        let mut aligned = false;
         let remaining = length as u64 - consumed;
         if remaining >= 4 {
             let next = reader.peek_signature()?;
-            if next != "8BIM" && next != "8B64" {
-                let four_padding = (4 - (data_length % 4)) % 4;
-                if four_padding > even_padding {
-                    reader.skip_bytes(four_padding - even_padding)?;
-                }
+            if next == "8BIM" || next == "8B64" {
+                aligned = true;
             }
-        } else if remaining > 0 {
-            reader.skip_bytes(remaining as usize)?;
+        }
+
+        if !aligned {
+            for padding in [1usize, 2, 3] {
+                let consumed = reader.offset.saturating_sub(start_offset);
+                if consumed + padding as u64 > length as u64 {
+                    break;
+                }
+                let pos = reader.offset;
+                reader.skip_bytes(padding)?;
+                let remaining = length as u64 - reader.offset.saturating_sub(start_offset);
+                if remaining >= 4 {
+                    let next = reader.peek_signature()?;
+                    if next == "8BIM" || next == "8B64" {
+                        aligned = true;
+                        break;
+                    }
+                } else {
+                    aligned = true;
+                    break;
+                }
+                reader.seek_to(pos)?;
+            }
+        }
+
+        if !aligned {
+            let consumed = reader.offset.saturating_sub(start_offset);
+            if consumed < length as u64 {
+                reader.skip_bytes((length as u64 - consumed) as usize)?;
+            }
         }
     }
 
@@ -3218,7 +3448,13 @@ fn tagged_block_uses_u64_length(key: &str, large: bool) -> bool {
         )
 }
 
-fn write_tagged_block(writer: &mut PsdWriter, key: &str, data: &[u8], large: bool) -> Result<()> {
+fn write_tagged_block(
+    writer: &mut PsdWriter,
+    key: &str,
+    data: &[u8],
+    large: bool,
+    padding: usize,
+) -> Result<()> {
     let signature = if tagged_block_uses_u64_length(key, large) {
         "8B64"
     } else {
@@ -3226,22 +3462,30 @@ fn write_tagged_block(writer: &mut PsdWriter, key: &str, data: &[u8], large: boo
     };
     writer.write_signature(signature)?;
     writer.write_signature(key)?;
+    let padding_len = if padding > 1 {
+        (padding - (data.len() % padding)) % padding
+    } else {
+        0
+    };
+    let stored_len = data.len() + padding_len;
+
     if signature == "8B64" {
         writer.write_u32(0)?;
     }
-    writer.write_u32(data.len() as u32)?;
+    writer.write_u32(stored_len as u32)?;
     writer.write_bytes(data)?;
-    let padding = (4 - (data.len() % 4)) % 4;
-    if padding != 0 {
-        writer.write_zeros(padding)?;
+    if padding_len != 0 {
+        writer.write_zeros(padding_len)?;
     }
     Ok(())
 }
 
-pub(crate) fn write_layer_additional_info_with_options(
+fn write_additional_info_subset_with_options(
     writer: &mut PsdWriter,
     info: &LayerAdditionalInfo,
     large: bool,
+    sections: &[&str],
+    raw_only_sections: &[&str],
 ) -> Result<()> {
     use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -3254,67 +3498,39 @@ pub(crate) fn write_layer_additional_info_with_options(
         }
     }
 
-    let raw_only_sections: HashSet<&str> = [
-        "LMsk", "Mtrn", "Mt16", "Mt32", "FXid", "abdd", "anFX", "cinf", "SoLE",
-    ]
-    .into_iter()
-    .collect();
-
-    let sections = vec![
-        "luni", "lyid", "lclr", "iOpa", "lsct", "clbl", "infx", "knko", "lspf", "lnsr", "lyvr",
-        "lmgm", "vmgm", "fcmy", "brst", "fxrp", "TySh", "Txt2", "SoCo", "GdFl", "PtFl", "vstk",
-        "vscg", "vmsk", "vogk", "lfx2", "lrFX", "clrL", "rplc", "PlLd", "SoLd", "artb", "sn2P",
-        "shmd", "FMsk", "shpa", "pths", "CgEd", "vibA", "PxSc", "phry", "Lr16", "Lr32", "lnk2",
-        "lnkD", "lnkD__", "lnk3", "FEid", "PxSD", "Anno", "LMsk", "Mtrn", "Mt16", "Mt32", "FXid",
-        "abdd", "anFX", "cinf", "SoLE",
-    ];
+    let raw_only_sections: HashSet<&str> = raw_only_sections.iter().copied().collect();
 
     let mut modeled_blocks = Vec::new();
-    for key in &sections {
+    for key in sections {
         if raw_only_sections.contains(disk_key(key)) {
             continue;
         }
-        // Create temporary writer for section data
         let mut temp_writer = PsdWriter::new(1024);
         let length = temp_writer.write_additional_info(key, info)?;
-
         if length > 0 {
             modeled_blocks.push((disk_key(key).to_string(), temp_writer.into_buffer()));
         }
     }
 
-    // Write adjustment layer block
-    if let Some(ref adj) = info.adjustment {
-        let adj_key = adj.key().to_string();
-        let data = adj
-            .to_bytes()
-            .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
-        modeled_blocks.push((adj_key, data));
-    }
-
-    // Write layer effects descriptor (lmfx)
-    if let Some(ref desc) = info.layer_effects_descriptor {
-        let mut lmfx_writer = PsdWriter::new(256);
-        lmfx_writer.write_u32(0)?; // version
-        lmfx_writer.write_version_and_descriptor(16, desc)?;
-        modeled_blocks.push(("lmfx".to_string(), lmfx_writer.into_buffer()));
-    }
-
-    // Write pattern block (Patt/Pat2/Pat3)
-    if let Some(ref block) = info.pattern_data {
-        let mut pattern_writer = PsdWriter::new(1024);
-        for pattern in &block.patterns {
-            let mut entry_writer = PsdWriter::new(1024);
-            entry_writer.write_pattern_entry(pattern)?;
-            let bytes = entry_writer.into_buffer();
-            pattern_writer.write_u32(bytes.len() as u32)?;
-            pattern_writer.write_bytes(&bytes)?;
-            let remainder = bytes.len() % 4;
-            if remainder != 0 {
-                pattern_writer.write_zeros(4 - remainder)?;
+    if sections
+        .iter()
+        .any(|key| matches!(disk_key(key), "Patt" | "Pat2" | "Pat3"))
+    {
+        if let Some(ref block) = info.pattern_data {
+            let mut pattern_writer = PsdWriter::new(1024);
+            for pattern in &block.patterns {
+                let mut entry_writer = PsdWriter::new(1024);
+                entry_writer.write_pattern_entry(pattern)?;
+                let bytes = entry_writer.into_buffer();
+                pattern_writer.write_u32(bytes.len() as u32)?;
+                pattern_writer.write_bytes(&bytes)?;
+                let remainder = bytes.len() % 4;
+                if remainder != 0 {
+                    pattern_writer.write_zeros(4 - remainder)?;
+                }
             }
+            modeled_blocks.push((block.key.as_ref().to_string(), pattern_writer.into_buffer()));
         }
-        modeled_blocks.push((block.key.as_ref().to_string(), pattern_writer.into_buffer()));
     }
 
     let emitted_keys: HashSet<&str> = modeled_blocks
@@ -3343,13 +3559,13 @@ pub(crate) fn write_layer_additional_info_with_options(
             let key = disk_key(key).to_string();
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(raw) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &raw, large)?;
+                    write_tagged_block(writer, &key, &raw, large, 4)?;
                     continue;
                 }
             }
             if let Some(queue) = modeled_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large)?;
+                    write_tagged_block(writer, &key, &data, large, 4)?;
                 }
             }
         }
@@ -3358,7 +3574,7 @@ pub(crate) fn write_layer_additional_info_with_options(
     for (key, _) in &modeled_blocks {
         if let Some(queue) = modeled_by_key.get_mut(key) {
             while let Some(data) = queue.pop_front() {
-                write_tagged_block(writer, key, &data, large)?;
+                write_tagged_block(writer, key, &data, large, 4)?;
             }
         }
     }
@@ -3368,12 +3584,145 @@ pub(crate) fn write_layer_additional_info_with_options(
         if !emitted_keys.contains(key.as_str()) {
             if let Some(queue) = raw_by_key.get_mut(&key) {
                 if let Some(data) = queue.pop_front() {
-                    write_tagged_block(writer, &key, &data, large)?;
+                    write_tagged_block(writer, &key, &data, large, 4)?;
                 }
             }
         }
     }
 
+    Ok(())
+}
+
+pub(crate) fn write_layer_additional_info_with_options(
+    writer: &mut PsdWriter,
+    info: &LayerAdditionalInfo,
+    large: bool,
+) -> Result<()> {
+    let sections = vec![
+        "luni", "lyid", "lclr", "iOpa", "lsct", "clbl", "infx", "knko", "lspf", "lnsr", "lyvr",
+        "lmgm", "vmgm", "fcmy", "brst", "fxrp", "TySh", "Txt2", "SoCo", "GdFl", "PtFl", "vstk",
+        "vscg", "vmsk", "vogk", "lfx2", "lrFX", "clrL", "rplc", "PlLd", "SoLd", "artb", "sn2P",
+        "shmd", "FMsk", "shpa", "pths", "CgEd", "vibA", "PxSc", "phry", "Lr16", "Lr32", "lnk2",
+        "lnkD", "lnkD__", "lnk3", "FEid", "PxSD", "Anno", "LMsk", "Mtrn", "Mt16", "Mt32", "FXid",
+        "abdd", "anFX", "cinf", "SoLE",
+    ];
+    let raw_only_sections = [
+        "LMsk", "Mtrn", "Mt16", "Mt32", "FXid", "abdd", "anFX", "cinf", "SoLE",
+    ];
+
+    // Write adjustment layer block
+    write_additional_info_subset_with_options(writer, info, large, &sections, &raw_only_sections)?;
+
+    if let Some(ref adj) = info.adjustment {
+        let adj_key = adj.key().to_string();
+        let data = adj
+            .to_bytes()
+            .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
+        write_tagged_block(writer, &adj_key, &data, large, 4)?;
+    }
+
+    if let Some(ref desc) = info.layer_effects_descriptor {
+        let mut lmfx_writer = PsdWriter::new(256);
+        lmfx_writer.write_u32(0)?;
+        lmfx_writer.write_version_and_descriptor(16, desc)?;
+        write_tagged_block(writer, "lmfx", &lmfx_writer.into_buffer(), large, 4)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn write_document_additional_info_with_options(
+    writer: &mut PsdWriter,
+    info: &LayerAdditionalInfo,
+    large: bool,
+) -> Result<()> {
+    let sections = [
+        "Txt2", "shmd", "Patt", "Pat2", "Pat3", "Anno", "lnk2", "lnkD", "lnkD__", "lnk3",
+        "FEid", "PxSD", "FMsk", "Mtrn", "Mt16", "Mt32", "cinf", "abdd", "anFX", "SoLE",
+    ];
+    let raw_only_sections = ["FMsk", "Mtrn", "Mt16", "Mt32", "cinf", "abdd", "anFX", "SoLE"];
+    use std::collections::{HashMap, HashSet, VecDeque};
+
+    fn disk_key(key: &str) -> &str {
+        match key {
+            "lnkD__" => "lnkD",
+            _ => key,
+        }
+    }
+
+    let raw_only_sections: HashSet<&str> = raw_only_sections.iter().copied().collect();
+    let mut modeled_blocks = Vec::new();
+    for key in &sections {
+        if raw_only_sections.contains(disk_key(key)) {
+            continue;
+        }
+        let mut temp_writer = PsdWriter::new(1024);
+        let length = temp_writer.write_additional_info(key, info)?;
+        if length > 0 {
+            modeled_blocks.push((disk_key(key).to_string(), temp_writer.into_buffer()));
+        }
+    }
+    if let Some(ref block) = info.pattern_data {
+        let mut pattern_writer = PsdWriter::new(1024);
+        for pattern in &block.patterns {
+            let mut entry_writer = PsdWriter::new(1024);
+            entry_writer.write_pattern_entry(pattern)?;
+            let bytes = entry_writer.into_buffer();
+            pattern_writer.write_u32(bytes.len() as u32)?;
+            pattern_writer.write_bytes(&bytes)?;
+            let remainder = bytes.len() % 4;
+            if remainder != 0 {
+                pattern_writer.write_zeros(4 - remainder)?;
+            }
+        }
+        modeled_blocks.push((block.key.as_ref().to_string(), pattern_writer.into_buffer()));
+    }
+
+    let emitted_keys: HashSet<&str> = modeled_blocks.iter().map(|(key, _)| key.as_str()).collect();
+    let mut modeled_by_key: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
+    for (key, data) in &modeled_blocks {
+        modeled_by_key.entry(key.clone()).or_default().push_back(data.clone());
+    }
+    let mut raw_by_key: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
+    for raw in &info.raw_blocks {
+        raw_by_key
+            .entry(disk_key(&raw.key).to_string())
+            .or_default()
+            .push_back(raw.data.clone());
+    }
+    if !info.tagged_block_order.is_empty() {
+        for key in &info.tagged_block_order {
+            let key = disk_key(key).to_string();
+            if let Some(queue) = raw_by_key.get_mut(&key) {
+                if let Some(raw) = queue.pop_front() {
+                    write_tagged_block(writer, &key, &raw, large, 4)?;
+                    continue;
+                }
+            }
+            if let Some(queue) = modeled_by_key.get_mut(&key) {
+                if let Some(data) = queue.pop_front() {
+                    write_tagged_block(writer, &key, &data, large, 4)?;
+                }
+            }
+        }
+    }
+    for (key, _) in &modeled_blocks {
+        if let Some(queue) = modeled_by_key.get_mut(key) {
+            while let Some(data) = queue.pop_front() {
+                write_tagged_block(writer, key, &data, large, 4)?;
+            }
+        }
+    }
+    for raw in &info.raw_blocks {
+        let key = disk_key(&raw.key).to_string();
+        if !emitted_keys.contains(key.as_str()) {
+            if let Some(queue) = raw_by_key.get_mut(&key) {
+                if let Some(data) = queue.pop_front() {
+                    write_tagged_block(writer, &key, &data, large, 4)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -3395,6 +3744,7 @@ pub fn write_layer_additional_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn vstk_descriptor_roundtrip() {
@@ -3571,6 +3921,7 @@ mod tests {
         info.vector_origination = Some(VectorOrigination {
             key_descriptor_list: vec![KeyDescriptorItem {
                 key_shape_invalidated: Some(true),
+                key_origin_index: None,
                 key_origin_type: Some(PsdIntCode(4)),
                 key_origin_resolution: Some(72.0),
                 key_origin_rrect_radii: None,
@@ -4139,14 +4490,14 @@ mod tests {
     #[test]
     fn unknown_tagged_block_roundtrips_via_raw_blocks() {
         let mut writer = PsdWriter::new(64);
-        write_tagged_block(&mut writer, "ZZZ1", &[1, 2, 3, 4, 5], false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[1, 2, 3, 4, 5], false, 2).unwrap();
         let bytes = writer.into_buffer();
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
         let parsed = read_layer_additional_info(&mut reader, bytes.len()).unwrap();
         assert_eq!(parsed.raw_blocks.len(), 1);
         assert_eq!(parsed.raw_blocks[0].key, "ZZZ1");
-        assert_eq!(parsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(parsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5, 0]);
 
         let mut rewritten = PsdWriter::new(64);
         write_layer_additional_info(&mut rewritten, &parsed).unwrap();
@@ -4158,15 +4509,15 @@ mod tests {
         let reparsed = read_layer_additional_info(&mut rereader, rewritten.len()).unwrap();
         assert_eq!(reparsed.raw_blocks.len(), 1);
         assert_eq!(reparsed.raw_blocks[0].key, "ZZZ1");
-        assert_eq!(reparsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(reparsed.raw_blocks[0].data, vec![1, 2, 3, 4, 5, 0]);
     }
 
     #[test]
     fn duplicate_unknown_tagged_blocks_preserve_multiplicity_and_order() {
         let mut writer = PsdWriter::new(128);
-        write_tagged_block(&mut writer, "ZZZ1", &[1], false).unwrap();
-        write_tagged_block(&mut writer, "ZZZ2", &[2], false).unwrap();
-        write_tagged_block(&mut writer, "ZZZ1", &[3], false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[1], false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ2", &[2], false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[3], false, 2).unwrap();
         let bytes = writer.into_buffer();
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
@@ -4182,9 +4533,9 @@ mod tests {
     #[test]
     fn mixed_modeled_and_unknown_tagged_blocks_preserve_original_order() {
         let mut writer = PsdWriter::new(128);
-        write_tagged_block(&mut writer, "ZZZ1", &[9], false).unwrap();
-        write_tagged_block(&mut writer, "lyid", &123u32.to_be_bytes(), false).unwrap();
-        write_tagged_block(&mut writer, "ZZZ2", &[8], false).unwrap();
+        write_tagged_block(&mut writer, "ZZZ1", &[9], false, 2).unwrap();
+        write_tagged_block(&mut writer, "lyid", &123u32.to_be_bytes(), false, 2).unwrap();
+        write_tagged_block(&mut writer, "ZZZ2", &[8], false, 2).unwrap();
         let bytes = writer.into_buffer();
 
         let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
@@ -4195,6 +4546,30 @@ mod tests {
         let rewritten = rewritten.into_buffer();
 
         assert_eq!(rewritten, bytes);
+    }
+
+    #[test]
+    fn layer_tagged_blocks_are_even_padded_on_write() {
+        let mut info = LayerAdditionalInfo::default();
+        info.raw_blocks.push(RawTaggedBlock {
+            key: "ZZZ1".to_string(),
+            data: vec![1],
+        });
+        info.raw_blocks.push(RawTaggedBlock {
+            key: "ZZZ2".to_string(),
+            data: vec![2],
+        });
+        info.tagged_block_order = vec!["ZZZ1".to_string(), "ZZZ2".to_string()];
+
+        let mut writer = PsdWriter::new(64);
+        write_layer_additional_info(&mut writer, &info).unwrap();
+        let bytes = writer.into_buffer();
+
+        let mut expected = PsdWriter::new(64);
+        write_tagged_block(&mut expected, "ZZZ1", &[1], false, 2).unwrap();
+        write_tagged_block(&mut expected, "ZZZ2", &[2], false, 2).unwrap();
+
+        assert_eq!(bytes, expected.into_buffer());
     }
 
     #[test]
@@ -4229,5 +4604,448 @@ mod tests {
 
         assert_eq!(len, 4);
         assert_eq!(buf, vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn sold_read_preserves_existing_plld_transform() {
+        let original = std::fs::read(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("samples")
+                .join("3d-preview-mockup.psd"),
+        )
+        .expect("read sample");
+        let psd = crate::read_psd(std::io::Cursor::new(original), Default::default())
+            .expect("parse sample");
+        let layer = psd
+            .children
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .find_map(|layer| {
+                fn find<'a>(layer: &'a crate::Layer, name: &str) -> Option<&'a crate::Layer> {
+                    if layer.additional_info.name.as_deref() == Some(name) {
+                        return Some(layer);
+                    }
+                    layer.children
+                        .as_deref()
+                        .and_then(|children| children.iter().find_map(|child| find(child, name)))
+                }
+                find(layer, "4")
+            })
+            .expect("sample layer 4");
+        let placed = layer.additional_info.placed_layer.as_ref().expect("placed layer");
+        assert!(
+            !placed.transform.is_empty(),
+            "PlLd transform should survive SoLd parsing on placed layers"
+        );
+    }
+
+    #[test]
+    fn sample_vmsk_preserves_fill_rule_and_initial_fill_record() {
+        fn extract_named_block(path: &PathBuf, layer_name: &str, key: &str) -> Vec<u8> {
+            let data = std::fs::read(path).expect("read sample");
+            let mut offset = 26usize;
+            let read_u32 = |bytes: &[u8], o: usize| {
+                u32::from_be_bytes(bytes[o..o + 4].try_into().expect("u32"))
+            };
+            let color_len = read_u32(&data, offset) as usize;
+            offset += 4 + color_len;
+            let image_resources_len = read_u32(&data, offset) as usize;
+            offset += 4 + image_resources_len;
+            let _layer_and_mask_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let _layer_info_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let layer_count =
+                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            offset += 2;
+
+            for _ in 0..layer_count {
+                offset += 16;
+                let channel_count =
+                    u16::from_be_bytes(data[offset..offset + 2].try_into().expect("u16")) as usize;
+                offset += 2 + channel_count * 6 + 12;
+                let extra_len = read_u32(&data, offset) as usize;
+                let extra_end = offset + 4 + extra_len;
+                offset += 4;
+                let mask_len = read_u32(&data, offset) as usize;
+                offset += 4 + mask_len;
+                let blend_len = read_u32(&data, offset) as usize;
+                offset += 4 + blend_len;
+                let name_len = data[offset] as usize;
+                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let padded_name_len = ((name_len + 1) + 3) & !3;
+                offset += padded_name_len;
+
+                let mut tagged_offset = offset;
+                while tagged_offset + 12 <= extra_end {
+                    let signature = &data[tagged_offset..tagged_offset + 4];
+                    if signature != b"8BIM" && signature != b"8B64" {
+                        break;
+                    }
+                    let block_key =
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                    let length = read_u32(&data, tagged_offset + 8) as usize;
+                    let data_start = tagged_offset + 12;
+                    let data_end = data_start + length;
+                    if name == layer_name && block_key == key {
+                        return data[data_start..data_end].to_vec();
+                    }
+                    tagged_offset = data_end;
+                    while tagged_offset < extra_end
+                        && tagged_offset + 4 <= extra_end
+                        && &data[tagged_offset..tagged_offset + 4] != b"8BIM"
+                        && &data[tagged_offset..tagged_offset + 4] != b"8B64"
+                    {
+                        tagged_offset += 1;
+                    }
+                }
+                offset = extra_end;
+            }
+
+            panic!("block {key} for layer {layer_name} not found");
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("samples")
+            .join("3d-preview-mockup.psd");
+        let original_block = extract_named_block(&path, "4", "vmsk");
+        let psd = crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
+            .expect("parse sample");
+        fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
+            for layer in layers {
+                if layer.additional_info.name.as_deref() == Some(name) {
+                    return Some(layer);
+                }
+                if let Some(found) = layer
+                    .children
+                    .as_deref()
+                    .and_then(|children| find_layer(children, name))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+
+        let mut writer = PsdWriter::new(512);
+        let length = writer
+            .write_additional_info("vmsk", &layer.additional_info)
+            .expect("write vmsk");
+        let rewritten = writer.into_buffer();
+
+        assert_eq!(length, original_block.len(), "vmsk block length changed");
+        assert_eq!(rewritten, original_block, "vmsk bytes changed after semantic roundtrip");
+    }
+
+    #[test]
+    fn sample_plld_preserves_legacy_payload_for_layer_4() {
+        fn extract_named_block(path: &PathBuf, layer_name: &str, key: &str) -> Vec<u8> {
+            let data = std::fs::read(path).expect("read sample");
+            let mut offset = 26usize;
+            let read_u32 = |bytes: &[u8], o: usize| {
+                u32::from_be_bytes(bytes[o..o + 4].try_into().expect("u32"))
+            };
+            let color_len = read_u32(&data, offset) as usize;
+            offset += 4 + color_len;
+            let image_resources_len = read_u32(&data, offset) as usize;
+            offset += 4 + image_resources_len;
+            let _layer_and_mask_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let _layer_info_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let layer_count =
+                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            offset += 2;
+
+            for _ in 0..layer_count {
+                offset += 16;
+                let channel_count =
+                    u16::from_be_bytes(data[offset..offset + 2].try_into().expect("u16")) as usize;
+                offset += 2 + channel_count * 6 + 12;
+                let extra_len = read_u32(&data, offset) as usize;
+                let extra_end = offset + 4 + extra_len;
+                offset += 4;
+                let mask_len = read_u32(&data, offset) as usize;
+                offset += 4 + mask_len;
+                let blend_len = read_u32(&data, offset) as usize;
+                offset += 4 + blend_len;
+                let name_len = data[offset] as usize;
+                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let padded_name_len = ((name_len + 1) + 3) & !3;
+                offset += padded_name_len;
+
+                let mut tagged_offset = offset;
+                while tagged_offset + 12 <= extra_end {
+                    let signature = &data[tagged_offset..tagged_offset + 4];
+                    if signature != b"8BIM" && signature != b"8B64" {
+                        break;
+                    }
+                    let block_key =
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                    let length = read_u32(&data, tagged_offset + 8) as usize;
+                    let data_start = tagged_offset + 12;
+                    let data_end = data_start + length;
+                    if name == layer_name && block_key == key {
+                        return data[data_start..data_end].to_vec();
+                    }
+                    tagged_offset = data_end;
+                    while tagged_offset < extra_end
+                        && tagged_offset + 4 <= extra_end
+                        && &data[tagged_offset..tagged_offset + 4] != b"8BIM"
+                        && &data[tagged_offset..tagged_offset + 4] != b"8B64"
+                    {
+                        tagged_offset += 1;
+                    }
+                }
+                offset = extra_end;
+            }
+
+            panic!("block {key} for layer {layer_name} not found");
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("samples")
+            .join("3d-preview-mockup.psd");
+        let original_block = extract_named_block(&path, "4", "PlLd");
+        let psd =
+            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
+                .expect("parse sample");
+        fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
+            for layer in layers {
+                if layer.additional_info.name.as_deref() == Some(name) {
+                    return Some(layer);
+                }
+                if let Some(found) = layer
+                    .children
+                    .as_deref()
+                    .and_then(|children| find_layer(children, name))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+
+        let mut writer = PsdWriter::new(2048);
+        let length = writer
+            .write_additional_info("PlLd", &layer.additional_info)
+            .expect("write PlLd");
+        let rewritten = writer.into_buffer();
+
+        assert_eq!(length, original_block.len(), "PlLd block length changed");
+        assert_eq!(rewritten, original_block, "PlLd bytes changed after semantic roundtrip");
+    }
+
+    #[test]
+    fn sample_plld_preserves_custom_envelope_warp_for_plants_layer() {
+        fn extract_named_block(path: &PathBuf, layer_name: &str, key: &str) -> Vec<u8> {
+            let data = std::fs::read(path).expect("read sample");
+            let mut offset = 26usize;
+            let read_u32 = |bytes: &[u8], o: usize| {
+                u32::from_be_bytes(bytes[o..o + 4].try_into().expect("u32"))
+            };
+            let color_len = read_u32(&data, offset) as usize;
+            offset += 4 + color_len;
+            let image_resources_len = read_u32(&data, offset) as usize;
+            offset += 4 + image_resources_len;
+            let _layer_and_mask_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let _layer_info_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let layer_count =
+                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            offset += 2;
+
+            for _ in 0..layer_count {
+                offset += 16;
+                let channel_count =
+                    u16::from_be_bytes(data[offset..offset + 2].try_into().expect("u16")) as usize;
+                offset += 2 + channel_count * 6 + 12;
+                let extra_len = read_u32(&data, offset) as usize;
+                let extra_end = offset + 4 + extra_len;
+                offset += 4;
+                let mask_len = read_u32(&data, offset) as usize;
+                offset += 4 + mask_len;
+                let blend_len = read_u32(&data, offset) as usize;
+                offset += 4 + blend_len;
+                let name_len = data[offset] as usize;
+                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let padded_name_len = ((name_len + 1) + 3) & !3;
+                offset += padded_name_len;
+
+                let mut tagged_offset = offset;
+                while tagged_offset + 12 <= extra_end {
+                    let signature = &data[tagged_offset..tagged_offset + 4];
+                    if signature != b"8BIM" && signature != b"8B64" {
+                        break;
+                    }
+                    let block_key =
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                    let length = read_u32(&data, tagged_offset + 8) as usize;
+                    let data_start = tagged_offset + 12;
+                    let data_end = data_start + length;
+                    if name == layer_name && block_key == key {
+                        return data[data_start..data_end].to_vec();
+                    }
+                    tagged_offset = data_end;
+                    while tagged_offset < extra_end
+                        && tagged_offset + 4 <= extra_end
+                        && &data[tagged_offset..tagged_offset + 4] != b"8BIM"
+                        && &data[tagged_offset..tagged_offset + 4] != b"8B64"
+                    {
+                        tagged_offset += 1;
+                    }
+                }
+                offset = extra_end;
+            }
+
+            panic!("block {key} for layer {layer_name} not found");
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("samples")
+            .join("4901393.psd");
+        let original_block = extract_named_block(&path, "Plants", "PlLd");
+        let psd =
+            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
+                .expect("parse sample");
+        fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
+            for layer in layers {
+                if layer.additional_info.name.as_deref() == Some(name) {
+                    return Some(layer);
+                }
+                if let Some(found) = layer
+                    .children
+                    .as_deref()
+                    .and_then(|children| find_layer(children, name))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "Plants").expect("plants layer");
+
+        let mut writer = PsdWriter::new(2048);
+        let length = writer
+            .write_additional_info("PlLd", &layer.additional_info)
+            .expect("write PlLd");
+        let rewritten = writer.into_buffer();
+
+        assert_eq!(length, original_block.len(), "PlLd block length changed");
+        assert_eq!(rewritten, original_block, "PlLd bytes changed after semantic roundtrip");
+    }
+
+    #[test]
+    fn sample_luni_preserves_adobe_padded_unicode_name_for_layer_4() {
+        fn extract_named_block(path: &PathBuf, layer_name: &str, key: &str) -> Vec<u8> {
+            let data = std::fs::read(path).expect("read sample");
+            let mut offset = 26usize;
+            let read_u32 = |bytes: &[u8], o: usize| {
+                u32::from_be_bytes(bytes[o..o + 4].try_into().expect("u32"))
+            };
+            let color_len = read_u32(&data, offset) as usize;
+            offset += 4 + color_len;
+            let image_resources_len = read_u32(&data, offset) as usize;
+            offset += 4 + image_resources_len;
+            let _layer_and_mask_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let _layer_info_len = read_u32(&data, offset) as usize;
+            offset += 4;
+            let layer_count =
+                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            offset += 2;
+
+            for _ in 0..layer_count {
+                offset += 16;
+                let channel_count =
+                    u16::from_be_bytes(data[offset..offset + 2].try_into().expect("u16")) as usize;
+                offset += 2 + channel_count * 6 + 12;
+                let extra_len = read_u32(&data, offset) as usize;
+                let extra_end = offset + 4 + extra_len;
+                offset += 4;
+                let mask_len = read_u32(&data, offset) as usize;
+                offset += 4 + mask_len;
+                let blend_len = read_u32(&data, offset) as usize;
+                offset += 4 + blend_len;
+                let name_len = data[offset] as usize;
+                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let padded_name_len = ((name_len + 1) + 3) & !3;
+                offset += padded_name_len;
+
+                let mut tagged_offset = offset;
+                while tagged_offset + 12 <= extra_end {
+                    let signature = &data[tagged_offset..tagged_offset + 4];
+                    if signature != b"8BIM" && signature != b"8B64" {
+                        break;
+                    }
+                    let block_key =
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                    let length = read_u32(&data, tagged_offset + 8) as usize;
+                    let data_start = tagged_offset + 12;
+                    let data_end = data_start + length;
+                    if name == layer_name && block_key == key {
+                        return data[data_start..data_end].to_vec();
+                    }
+                    tagged_offset = data_end;
+                    while tagged_offset < extra_end
+                        && tagged_offset + 4 <= extra_end
+                        && &data[tagged_offset..tagged_offset + 4] != b"8BIM"
+                        && &data[tagged_offset..tagged_offset + 4] != b"8B64"
+                    {
+                        tagged_offset += 1;
+                    }
+                }
+                offset = extra_end;
+            }
+
+            panic!("block {key} for layer {layer_name} not found");
+        }
+
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("samples")
+            .join("3d-preview-mockup.psd");
+        let original_block = extract_named_block(&path, "4", "luni");
+        let psd =
+            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
+                .expect("parse sample");
+        fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
+            for layer in layers {
+                if layer.additional_info.name.as_deref() == Some(name) {
+                    return Some(layer);
+                }
+                if let Some(found) = layer
+                    .children
+                    .as_deref()
+                    .and_then(|children| find_layer(children, name))
+                {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+
+        let mut writer = PsdWriter::new(64);
+        let length = writer
+            .write_additional_info("luni", &layer.additional_info)
+            .expect("write luni");
+        let rewritten = writer.into_buffer();
+
+        assert_eq!(length, original_block.len(), "luni block length changed");
+        assert_eq!(rewritten, original_block, "luni bytes changed after semantic roundtrip");
     }
 }

@@ -1196,12 +1196,14 @@ mod remaining_tagged_block_parity {
         layer.opacity = Some(1.0);
         layer.additional_info.name = Some("Text".to_string());
         layer.additional_info.text = Some(psd_great::additional_info::TextLayerData {
+            raw_bytes: None,
             transform: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             text: "Hello".to_string(),
             text_version: 50,
             descriptor_version: 16,
             text_data: Some(text_desc),
             warp_version: 1,
+            warp_descriptor_version: 16,
             warp_data: Some(psd_great::descriptor::Descriptor {
                 name: String::new(),
                 class_id: "warp".to_string(),
@@ -1707,12 +1709,14 @@ mod remaining_tagged_block_parity {
         );
 
         layer.additional_info.text = Some(psd_great::additional_info::TextLayerData {
+            raw_bytes: None,
             transform: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
             text: "Hello".to_string(),
             text_version: 50,
             descriptor_version: 16,
             text_data: Some(text_descriptor),
             warp_version: 1,
+            warp_descriptor_version: 16,
             warp_data: Some(psd_great::descriptor::Descriptor {
                 name: String::new(),
                 class_id: "warp".to_string(),
@@ -1816,11 +1820,12 @@ mod remaining_tagged_block_parity {
             anti_alias_policy: Some(psd_great::PsdIntCode(1)),
             placed_layer_type: Some(psd_great::PsdIntCode(1)),
             transform: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            warp: Some(Descriptor {
+            legacy_warp: Some(Descriptor {
                 name: String::new(),
                 class_id: "null".to_string(),
                 items: HashMap::from([("warpStyle".to_string(), DescriptorValue::Integer(0))]),
             }),
+            sold_descriptor: None,
             placed: None,
         });
 
@@ -1843,7 +1848,8 @@ mod remaining_tagged_block_parity {
             anti_alias_policy: None,
             placed_layer_type: None,
             transform: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-            warp: Some(Descriptor {
+            legacy_warp: None,
+            sold_descriptor: Some(Descriptor {
                 name: String::new(),
                 class_id: "null".to_string(),
                 items: HashMap::from([("warpStyle".to_string(), DescriptorValue::Integer(0))]),

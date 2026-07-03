@@ -119,6 +119,12 @@ impl<R: Read + Seek> PsdReader<R> {
         Ok(())
     }
 
+    pub(crate) fn seek_to(&mut self, position: u64) -> Result<()> {
+        self.reader.seek(SeekFrom::Start(position))?;
+        self.offset = position;
+        Ok(())
+    }
+
     /// Read all remaining bytes to EOF from current offset.
     pub fn read_remaining_bytes(&mut self) -> Result<Vec<u8>> {
         let cur = self.reader.stream_position()?;
@@ -489,7 +495,7 @@ fn read_layer_and_mask_info<R: Read + Seek>(
     reader.read_section(1, |reader, end_offset| {
         // Read layer info
         if reader.bytes_left(end_offset) > 0 {
-            reader.read_section(1, |reader, end_offset| {
+            reader.read_section(2, |reader, end_offset| {
                 read_layer_info(reader, psd)?;
                 reader.skip_bytes(reader.bytes_left(end_offset))?;
                 Ok(())
