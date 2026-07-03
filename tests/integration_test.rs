@@ -933,6 +933,47 @@ fn psb_write_read_roundtrip() {
 }
 
 #[test]
+fn psb_color_mode_data_uses_four_byte_section_length() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        color_mode_data: Some(psd_great::psd::ColorModeSectionData {
+            bytes: vec![9, 8, 7, 6],
+        }),
+        bits_per_channel: Some(8),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(
+        &psd,
+        &WriteOptions {
+            psb: Some(true),
+            compress: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(
+        read.color_mode_data.as_ref().map(|data| data.bytes.as_slice()),
+        Some(&[9, 8, 7, 6][..])
+    );
+    assert_eq!(read.children.as_ref().map(|children| children.len()), Some(1));
+}
+
+#[test]
 fn psb_rle_roundtrip() {
     let psd = Psd {
         width: 8,
