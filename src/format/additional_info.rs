@@ -1655,11 +1655,7 @@ impl<R: Read + Seek> PsdReader<R> {
     }
 
     fn read_unicode_layer_name(&mut self, info: &mut LayerAdditionalInfo) -> Result<()> {
-        let mut name = self.read_unicode_string()?;
-        if name.ends_with('\0') {
-            name.pop();
-        }
-        info.name = Some(name);
+        info.name = Some(self.read_unicode_string()?);
         Ok(())
     }
 

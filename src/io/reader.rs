@@ -179,19 +179,14 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read a Unicode string with known length
     pub fn read_unicode_string_with_length(&mut self, length: usize) -> Result<String> {
-        let mut chars = Vec::with_capacity(length);
-
+        let mut units = Vec::with_capacity(length);
         for _ in 0..length {
-            let value = self.read_u16()?;
-            // Skip null bytes (padding/termination)
-            if value != 0 {
-                if let Some(c) = char::from_u32(value as u32) {
-                    chars.push(c);
-                }
-            }
+            units.push(self.read_u16()?);
         }
-
-        Ok(chars.into_iter().collect())
+        if units.last() == Some(&0) {
+            units.pop();
+        }
+        Ok(String::from_utf16_lossy(&units))
     }
 
     /// Read an ASCII string

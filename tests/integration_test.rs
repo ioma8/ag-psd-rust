@@ -858,6 +858,39 @@ fn read_color_preserves_raw_rgb_hsb_lab_values() {
 }
 
 #[test]
+fn non_ascii_layer_names_roundtrip() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }),
+            additional_info: psd_great::additional_info::LayerAdditionalInfo {
+                name: Some("Žluťoučký 😀".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(
+        read.children.unwrap()[0].additional_info.name.as_deref(),
+        Some("Žluťoučký 😀")
+    );
+}
+
+#[test]
 fn write_color_roundtrips_raw_color_structures_exactly() {
     let colors = [
         Color::Rgb48 {

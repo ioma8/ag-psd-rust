@@ -184,25 +184,22 @@ impl PsdWriter {
 
     /// Write a Unicode string (UTF-16 BE)
     pub fn write_unicode_string(&mut self, text: &str) -> Result<()> {
-        self.write_u32(text.len() as u32)?;
-
-        for ch in text.chars() {
-            self.write_u16(ch as u16)?;
+        let units: Vec<u16> = text.encode_utf16().collect();
+        self.write_u32(units.len() as u32)?;
+        for unit in units {
+            self.write_u16(unit)?;
         }
-
         Ok(())
     }
 
     /// Write a Unicode string with padding
     pub fn write_unicode_string_with_padding(&mut self, text: &str) -> Result<()> {
-        self.write_u32((text.len() + 1) as u32)?;
-
-        for ch in text.chars() {
-            self.write_u16(ch as u16)?;
+        let units: Vec<u16> = text.encode_utf16().collect();
+        self.write_u32((units.len() + 1) as u32)?;
+        for unit in units {
+            self.write_u16(unit)?;
         }
-
         self.write_u16(0)?;
-
         Ok(())
     }
 
