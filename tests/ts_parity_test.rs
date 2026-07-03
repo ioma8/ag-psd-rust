@@ -1223,10 +1223,10 @@ mod remaining_tagged_block_parity {
                 class_id: "warp".to_string(),
                 items: HashMap::new(),
             }),
-            left: 0.0,
-            top: 0.0,
-            right: 1.0,
-            bottom: 1.0,
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
         });
 
         let mut psd = Psd::default();
@@ -1736,10 +1736,10 @@ mod remaining_tagged_block_parity {
                 class_id: "warp".to_string(),
                 items: HashMap::new(),
             }),
-            left: 0.0,
-            top: 0.0,
-            right: 1.0,
-            bottom: 1.0,
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
         });
 
         let mut psd = Psd::default();

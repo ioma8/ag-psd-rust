@@ -1341,13 +1341,7 @@ pub fn read_image_resources<R: Read + Seek>(
             }
         }
 
-        // Ensure we consumed exactly the right amount
-        let consumed = (reader.offset - resource_start) as usize;
-        if consumed < data_length {
-            reader.skip_bytes(data_length - consumed)?;
-        }
-
-        // Align to even boundary
+        reader.seek_to(resource_start + data_length as u64)?;
         if data_length % 2 != 0 {
             reader.skip_bytes(1)?;
         }
@@ -1925,6 +1919,35 @@ mod tests {
         let mut out = PsdWriter::new(64);
         write_image_resources(&mut out, &resources).unwrap();
         assert_eq!(out.into_buffer(), bytes);
+    }
+
+    #[test]
+    fn modeled_image_resource_underread_does_not_desync_next_resource() {
+        let mut writer = PsdWriter::new(64);
+        writer.write_signature("8BIM").unwrap();
+        writer.write_u16(1037).unwrap();
+        writer.write_u8(0).unwrap();
+        writer.write_u8(0).unwrap();
+        writer.write_u32(6).unwrap();
+        writer.write_u32(90).unwrap();
+        writer.write_u16(0xBEEF).unwrap();
+        writer.write_signature("8BIM").unwrap();
+        writer.write_u16(8001).unwrap();
+        writer.write_u8(0).unwrap();
+        writer.write_u8(0).unwrap();
+        writer.write_u32(1).unwrap();
+        writer.write_u8(2).unwrap();
+        writer.write_u8(0).unwrap();
+
+        let bytes = writer.into_buffer();
+        let len = bytes.len();
+        let mut reader = PsdReader::new(std::io::Cursor::new(bytes), Default::default());
+        let resources = read_image_resources(&mut reader, len).unwrap();
+
+        assert_eq!(resources.global_angle, Some(90));
+        assert_eq!(resources.resource_order, vec![1037, 8001]);
+        assert_eq!(resources.raw_resources.len(), 1);
+        assert_eq!(resources.raw_resources[0].resource_id, 8001);
     }
 
     #[test]

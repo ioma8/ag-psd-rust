@@ -450,10 +450,10 @@ pub struct TextLayerData {
     pub warp_version: u16,
     pub warp_descriptor_version: u32,
     pub warp_data: Option<Descriptor>,
-    pub left: f32,
-    pub top: f32,
-    pub right: f32,
-    pub bottom: f32,
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
 }
 
 /// Vector fill
@@ -1700,10 +1700,10 @@ impl<R: Read + Seek> PsdReader<R> {
         let warp_descriptor = self.read_descriptor_structure()?;
 
         // Read bounds
-        let left = self.read_f32()?;
-        let top = self.read_f32()?;
-        let right = self.read_f32()?;
-        let bottom = self.read_f32()?;
+        let left = self.read_i32()?;
+        let top = self.read_i32()?;
+        let right = self.read_i32()?;
+        let bottom = self.read_i32()?;
 
         // Extract text from descriptor
         let text = text_descriptor
@@ -2579,10 +2579,10 @@ impl PsdWriter {
                                 wd,
                             )?;
                         }
-                        temp_writer.write_f32(text.left)?;
-                        temp_writer.write_f32(text.top)?;
-                        temp_writer.write_f32(text.right)?;
-                        temp_writer.write_f32(text.bottom)?;
+                        temp_writer.write_i32(text.left)?;
+                        temp_writer.write_i32(text.top)?;
+                        temp_writer.write_i32(text.right)?;
+                        temp_writer.write_i32(text.bottom)?;
                     }
                 }
             }
