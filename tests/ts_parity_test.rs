@@ -340,7 +340,14 @@ mod header_parity {
             ..Default::default()
         };
 
-        let output = write_psd(&psd, &WriteOptions::default()).unwrap();
+        let output = write_psd(
+            &psd,
+            &WriteOptions {
+                compress: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // Check signature (first 4 bytes)
         assert_eq!(&output[0..4], b"8BPS");
@@ -421,7 +428,14 @@ mod merged_image_parity {
             ..Default::default()
         };
 
-        let output = write_psd(&psd, &WriteOptions::default()).unwrap();
+        let output = write_psd(
+            &psd,
+            &WriteOptions {
+                compress: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         // The last bytes should contain the merged image data
         let len = output.len();

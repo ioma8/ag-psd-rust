@@ -520,6 +520,7 @@ pub(crate) fn flatten_layers(children: Option<&Vec<Layer>>) -> Vec<Layer> {
                 // Add synthetic closing marker first, matching Adobe flat layer order.
                 let mut closing = Layer::default();
                 closing.additional_info.name = Some("</Layer group>".to_string());
+                closing.additional_info.id = child.additional_info.id;
                 closing.additional_info.section_divider = Some(SectionDivider {
                     divider_type: crate::api::types::SectionDividerType::BoundingSectionDivider,
                     blend_mode: None,

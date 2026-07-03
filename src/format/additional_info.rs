@@ -1233,7 +1233,7 @@ impl<R: Read + Seek> PsdReader<R> {
                     }
                     let chars_len = self.read_u32()? as usize;
                     self.skip_bytes(2)?;
-                    let text = self.read_unicode_string_with_length(chars_len / 2)?;
+                    let text = self.read_unicode_string_with_length(chars_len.saturating_sub(2) / 2)?;
                     let consumed = (self.offset - item_start) as usize;
                     if consumed < item_length {
                         self.skip_bytes(item_length - consumed)?;
@@ -3200,13 +3200,14 @@ impl PsdWriter {
                             &mut item_writer,
                             "D:20211012120233+01'00'",
                         )?;
-                        item_writer.write_u32((12 + 2 + item.text.len() * 2) as u32)?;
+                        let text_units: Vec<u16> = item.text.encode_utf16().collect();
+                        item_writer.write_u32((12 + 2 + text_units.len() * 2) as u32)?;
                         item_writer.write_signature("txtC")?;
-                        item_writer.write_u32((2 + item.text.len() * 2) as u32)?;
+                        item_writer.write_u32((2 + text_units.len() * 2) as u32)?;
                         item_writer.write_u8(254)?;
                         item_writer.write_u8(255)?;
-                        for ch in item.text.chars() {
-                            item_writer.write_u16(ch as u16)?;
+                        for unit in text_units {
+                            item_writer.write_u16(unit)?;
                         }
                         let bytes = item_writer.into_buffer();
                         temp_writer.write_u32(bytes.len() as u32)?;

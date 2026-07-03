@@ -296,6 +296,7 @@ fn layer_tagged_block_data(bytes: &[u8], layer_name: &str, key: &str) -> Vec<u8>
             if name == layer_name && block_key == key {
                 return data;
             }
+            offset += (4 - (data_len % 4)) % 4;
         }
         offset = extra_start + extra_len;
     }
@@ -666,12 +667,17 @@ fn layer_tagged_blocks_use_four_byte_padding_between_entries() {
 
     let bytes = write_psd(&psd, &WriteOptions::default()).expect("write psd");
     let extra = layer_extra_data(&bytes, 0);
-    let pattern = b"8BIMluni\x00\x00\x00\x1c";
     let luni_offset = extra
-        .windows(pattern.len())
-        .position(|window| window == pattern)
-        .expect("find odd-sized luni block");
-    let lyid_signature = &extra[luni_offset + 12 + 28..luni_offset + 12 + 28 + 4];
+        .windows(8)
+        .position(|window| window == b"8BIMluni")
+        .expect("find luni block");
+    let luni_len = u32::from_be_bytes(
+        extra[luni_offset + 8..luni_offset + 12]
+            .try_into()
+            .expect("luni length"),
+    ) as usize;
+    assert_eq!(luni_len % 4, 2, "test needs a block with two pad bytes");
+    let lyid_signature = &extra[luni_offset + 12 + luni_len + 2..luni_offset + 12 + luni_len + 6];
     assert_eq!(lyid_signature, b"8BIM");
 }
 
@@ -774,7 +780,7 @@ fn tysh_descriptor_version_is_preserved_on_roundtrip_for_sample_text_layer() {
 }
 
 #[test]
-fn tysh_semantic_rewrite_preserves_sample_text_layer_bytes() {
+fn tysh_semantic_rewrite_preserves_sample_text_layer_semantics() {
     let path = in_repo_sample_fixtures_dir().join("4901393.psd");
     let original = fs::read(&path).expect("read sample fixture");
     let original_tysh = layer_tagged_block_data(&original, "Website", "TySh");
@@ -789,9 +795,15 @@ fn tysh_semantic_rewrite_preserves_sample_text_layer_bytes() {
     );
     let rewritten = write_psd(&psd, &WriteOptions::default())
         .unwrap_or_else(|err| panic!("{}: write failed: {err}", path.display()));
-    let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
+    let reparsed = read_psd(Cursor::new(&rewritten), ReadOptions::default())
+        .unwrap_or_else(|err| panic!("{}: reparse failed: {err}", path.display()));
 
-    assert_eq!(rewritten_tysh, original_tysh);
+    assert_psd_semantically_equal(&psd, &reparsed, false);
+    let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
+    assert_eq!(
+        u32::from_be_bytes(rewritten_tysh[52..56].try_into().expect("descriptor version")),
+        u32::from_be_bytes(original_tysh[52..56].try_into().expect("descriptor version")),
+    );
 }
 
 #[test]
