@@ -891,6 +891,48 @@ fn non_ascii_layer_names_roundtrip() {
 }
 
 #[test]
+fn psb_write_read_roundtrip() {
+    let psd = Psd {
+        width: 4,
+        height: 4,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        image_data: Some(PixelData {
+            data: vec![128u8; 4 * 4 * 4],
+            width: 4,
+            height: 4,
+        }),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(4),
+            right: Some(4),
+            image_data: Some(PixelData {
+                data: vec![200u8; 4 * 4 * 4],
+                width: 4,
+                height: 4,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(
+        &psd,
+        &WriteOptions {
+            psb: Some(true),
+            compress: Some(false),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!((read.width, read.height), (4, 4));
+    assert_eq!(read.children.as_ref().map(|c| c.len()), Some(1));
+    let layer = &read.children.unwrap()[0];
+    assert_eq!(layer.image_data.as_ref().unwrap().data[0], 200);
+}
+
+#[test]
 fn write_color_roundtrips_raw_color_structures_exactly() {
     let colors = [
         Color::Rgb48 {

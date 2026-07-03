@@ -195,12 +195,12 @@ impl<R: Read + Seek> PsdReader<R> {
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
-    /// Read a section with length prefix
-    pub fn read_section<F, T>(&mut self, round: usize, func: F) -> Result<T>
+    /// Read a section with length prefix.
+    pub fn read_section<F, T>(&mut self, round: usize, eight_byte: bool, func: F) -> Result<T>
     where
         F: FnOnce(&mut Self, u64) -> Result<T>,
     {
-        let length = if self.large {
+        let length = if eight_byte {
             let high = self.read_u32()? as usize;
             if high != 0 {
                 return Err(PsdError::UnsupportedFeature(
@@ -422,7 +422,7 @@ pub fn read_psd<R: Read + Seek>(mut reader: R, options: ReadOptions) -> Result<P
 
 /// Read color mode data section
 fn read_color_mode_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> Result<()> {
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, reader.large, |reader, end_offset| {
         if reader.bytes_left(end_offset) == 0 {
             return Ok(());
         }
@@ -468,7 +468,7 @@ fn read_color_mode_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd
 
 /// Read image resources section
 fn read_image_resources<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> Result<()> {
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         let remaining = reader.bytes_left(end_offset) as usize;
         if remaining > 0 {
             let resources = crate::format::image_resources::read_image_resources(reader, remaining)?;
@@ -487,10 +487,10 @@ fn read_layer_and_mask_info<R: Read + Seek>(
     reader: &mut PsdReader<R>,
     psd: &mut Psd,
 ) -> Result<()> {
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         // Read layer info
         if reader.bytes_left(end_offset) > 0 {
-            reader.read_section(2, |reader, end_offset| {
+            reader.read_section(2, reader.large, |reader, end_offset| {
                 read_layer_info(reader, psd)?;
                 reader.skip_bytes(reader.bytes_left(end_offset))?;
                 Ok(())
@@ -599,7 +599,7 @@ fn read_layer_record<R: Read + Seek>(
     layer.hidden = Some(blend_flags.contains(LayerBlendFlags::HIDDEN));
 
     // Read extra data
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         // Read layer mask data
         let channel_ids: Vec<i16> = channels.iter().map(|c| c.id as i16).collect();
         read_layer_mask_data(reader, &mut layer, &channel_ids)?;
@@ -677,7 +677,7 @@ fn read_layer_mask_data<R: Read + Seek>(
     layer: &mut Layer,
     channel_ids: &[i16],
 ) -> Result<()> {
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         if reader.bytes_left(end_offset) == 0 {
             return Ok(());
         }
@@ -1177,7 +1177,7 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
 fn read_global_layer_mask_info<R: Read + Seek>(
     reader: &mut PsdReader<R>,
 ) -> Result<Option<GlobalLayerMaskInfo>> {
-    reader.read_section(1, |reader, end_offset| {
+    reader.read_section(1, false, |reader, end_offset| {
         if reader.bytes_left(end_offset) == 0 {
             return Ok(None);
         }
@@ -1575,10 +1575,10 @@ mod tests {
         read_color_mode_data(&mut reader, &mut psd)?;
         read_image_resources(&mut reader, &mut psd)?;
 
-        reader.read_section(1, |reader, end_offset| {
+        reader.read_section(1, reader.large, |reader, end_offset| {
             let mut flat_layers = Vec::new();
             if reader.bytes_left(end_offset) > 0 {
-                reader.read_section(2, |reader, end_offset| {
+                reader.read_section(2, reader.large, |reader, end_offset| {
                     let mut layer_count = reader.read_i16()? as i32;
                     if layer_count < 0 {
                         layer_count = -layer_count;
@@ -1652,7 +1652,7 @@ mod tests {
         ];
         let mut reader = PsdReader::new(Cursor::new(data), ReadOptions::default());
         let payload = reader
-            .read_section(2, |r, _| r.read_u8())
+            .read_section(2, false, |r, _| r.read_u8())
             .expect("read section");
         assert_eq!(payload, 0xAA);
         let next = reader.read_u8().expect("next byte");
