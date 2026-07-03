@@ -972,6 +972,31 @@ fn psb_rle_roundtrip() {
 }
 
 #[test]
+fn writing_synthesized_layers_in_non_rgb_mode_errors() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::CMYK),
+        bits_per_channel: Some(8),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let err = write_psd(&psd, &WriteOptions::default()).unwrap_err();
+    assert!(matches!(err, psd_great::PsdError::UnsupportedFeature(_)));
+}
+
+#[test]
 fn write_color_roundtrips_raw_color_structures_exactly() {
     let colors = [
         Color::Rgb48 {

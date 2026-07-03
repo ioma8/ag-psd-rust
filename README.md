@@ -57,7 +57,7 @@ fn main() -> Result<()> {
 | PSD/PSB structure | Broad support | Reader and writer cover the main parser/writer surface |
 | Layers, masks, effects | Broad support | Includes vector masks, many tagged blocks, and effect structures |
 | Text layers | Partial | Rich text structures are supported, but not every Photoshop text workflow is exhaustively validated |
-| Color modes | Partial | Indexed palettes and generic color-mode data are supported; some composite-image behavior still varies by mode |
+| Color modes | Partial | Reads RGB/Grayscale/CMYK/Indexed/Bitmap composites; CMYK/Grayscale layer pixels are preserved via raw data only, and synthesizing new non-RGB layers from RGBA image data returns an error |
 | 16/32-bit depth | Partial | Structural support exists, but not every path is fully validated end to end |
 | Smart objects / linked data | Partial | Typed structures exist, but not every Photoshop workflow is exhaustively covered |
 

@@ -481,6 +481,19 @@ fn write_layer_info(
     let bits_per_channel = psd.bits_per_channel.unwrap_or(8);
     writer.write_section_with_length_mode(2, psb, true, |writer| {
         let layers = flatten_layers(psd.children.as_ref());
+        let color_mode = psd.color_mode.unwrap_or(ColorMode::RGB);
+        if color_mode != ColorMode::RGB {
+            // ponytail: synthesized layer channels are RGB-only; non-RGB layer pixels
+            // roundtrip via raw_data. Add CMYK/Grayscale synthesis when needed.
+            let has_synthesized = layers
+                .iter()
+                .any(|layer| layer.raw_data.is_none() && layer.image_data.is_some());
+            if has_synthesized {
+                return Err(PsdError::UnsupportedFeature(format!(
+                    "Writing layers without raw channel data is only supported in RGB mode (document is {color_mode:?})"
+                )));
+            }
+        }
         let prepared_payloads: Vec<PreparedLayerChannels> = layers
             .iter()
             .map(|layer| prepare_layer_channels(layer, bits_per_channel, options))

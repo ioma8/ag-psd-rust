@@ -707,9 +707,9 @@ mod layer_channels_parity {
         let psd = Psd {
             width: 1,
             height: 1,
-            channels: Some(1),
+            channels: Some(3),
             bits_per_channel: Some(32),
-            color_mode: Some(ColorMode::Grayscale),
+            color_mode: Some(ColorMode::RGB),
             children: Some(vec![layer]),
             ..Default::default()
         };
