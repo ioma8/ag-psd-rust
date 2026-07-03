@@ -1416,6 +1416,7 @@ fn apply_text_prewrite(psd: &mut Psd) -> Result<()> {
 
         psd.additional_info.text_engine = Some(crate::format::additional_info::TextEngineBlock {
             data: EngineValue::Object(synthesized),
+            raw: None,
         });
     }
 

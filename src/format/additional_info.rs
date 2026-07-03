@@ -299,6 +299,7 @@ pub struct RawTaggedBlock {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextEngineBlock {
     pub data: crate::support::engine_data::EngineValue,
+    pub raw: Option<Vec<u8>>,
 }
 
 /// Annotation item (Anno)
@@ -1176,7 +1177,10 @@ impl<R: Read + Seek> PsdReader<R> {
                     crate::support::engine_data::parse_engine_data(&raw[4..4 + bounded])
                         .map_err(|e| PsdError::InvalidFormat(e.to_string()))
                 })?;
-                info.text_engine = Some(TextEngineBlock { data: parsed });
+                info.text_engine = Some(TextEngineBlock {
+                    data: parsed,
+                    raw: Some(raw),
+                });
             }
             "LMsk" | "Mtrn" | "Mt16" | "Mt32" | "FXid" => {
                 info.raw_blocks.push(RawTaggedBlock {
@@ -3141,9 +3145,14 @@ impl PsdWriter {
             }
             "Txt2" => {
                 if let Some(ref text_engine) = info.text_engine {
-                    let bytes = crate::support::engine_data::serialize_engine_data(&text_engine.data, true)
-                        .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
-                    temp_writer.write_bytes(&bytes)?;
+                    if let Some(ref raw) = text_engine.raw {
+                        temp_writer.write_bytes(raw)?;
+                    } else {
+                        let bytes =
+                            crate::support::engine_data::serialize_engine_data(&text_engine.data, true)
+                                .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
+                        temp_writer.write_bytes(&bytes)?;
+                    }
                 }
             }
             "LMsk" | "Mtrn" | "Mt16" | "Mt32" | "FXid" | "abdd" | "anFX" | "cinf" | "SoLE" => {
@@ -4428,6 +4437,7 @@ mod tests {
         let mut info = LayerAdditionalInfo::default();
         info.text_engine = Some(TextEngineBlock {
             data: engine.clone(),
+            raw: None,
         });
 
         let mut w = PsdWriter::new(256);
@@ -4438,7 +4448,10 @@ mod tests {
         reader
             .read_additional_info("Txt2", len, &mut reparsed)
             .unwrap();
-        assert_eq!(reparsed.text_engine, info.text_engine);
+        assert_eq!(
+            reparsed.text_engine.as_ref().map(|block| &block.data),
+            info.text_engine.as_ref().map(|block| &block.data)
+        );
     }
 
     #[test]
@@ -4522,24 +4535,38 @@ mod tests {
     }
 
     #[test]
-    fn txt2_writes_inner_length_prefix() {
+    fn txt2_preserves_raw_bytes_verbatim() {
+        let raw = b" << /0 1 /1 [ 1.0 ] >> \0\0".to_vec();
+        let mut info = LayerAdditionalInfo::default();
+        let parsed = crate::support::engine_data::parse_engine_data(&raw).unwrap();
+        info.text_engine = Some(TextEngineBlock {
+            data: parsed,
+            raw: Some(raw.clone()),
+        });
+
+        let mut w = PsdWriter::new(256);
+        let len = w.write_additional_info("Txt2", &info).unwrap();
+        assert_eq!(w.into_buffer()[..len], raw[..]);
+    }
+
+    #[test]
+    fn txt2_synthesized_has_no_inner_length_prefix() {
         use std::collections::HashMap;
         let engine = crate::support::engine_data::EngineValue::Object(HashMap::from([(
             "_DocumentObjects".to_string(),
             crate::support::engine_data::EngineValue::Object(HashMap::new()),
         )]));
         let mut info = LayerAdditionalInfo::default();
-        info.text_engine = Some(TextEngineBlock { data: engine });
+        info.text_engine = Some(TextEngineBlock {
+            data: engine,
+            raw: None,
+        });
 
         let mut w = PsdWriter::new(256);
-        let len = w.write_additional_info("Txt2", &info).unwrap() as usize;
+        let len = w.write_additional_info("Txt2", &info).unwrap();
         let buf = w.into_buffer();
-
-        assert!(len >= 4);
-        assert_eq!(
-            u32::from_be_bytes(buf[0..4].try_into().unwrap()) as usize,
-            len - 4
-        );
+        assert!(len > 0);
+        assert_eq!(buf[0], b' ');
     }
 
     #[test]
