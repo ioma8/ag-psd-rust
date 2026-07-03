@@ -53,11 +53,8 @@ impl PsdWriter {
     fn ensure_capacity(&mut self, additional: usize) {
         let required = self.offset + additional;
         if self.buffer.len() < required {
-            let mut new_capacity = self.buffer.capacity();
-            while new_capacity < required {
-                new_capacity *= 2;
-            }
-            self.buffer.resize(new_capacity, 0);
+            let new_len = required.max(self.buffer.capacity().max(64) * 2);
+            self.buffer.resize(new_len, 0);
         }
     }
 
@@ -500,9 +497,9 @@ fn write_layer_info(
             .collect::<Result<Vec<PreparedLayerChannels>>>()?;
 
         let layer_count = if global_alpha {
-            -(layers.len() as i16)
+            -layer_count_i16(layers.len())?
         } else {
-            layers.len() as i16
+            layer_count_i16(layers.len())?
         };
         writer.write_i16(layer_count)?;
 
@@ -567,6 +564,12 @@ pub(crate) fn flatten_layers(children: Option<&Vec<Layer>>) -> Vec<Layer> {
     }
 
     result
+}
+
+fn layer_count_i16(count: usize) -> Result<i16> {
+    i16::try_from(count).map_err(|_| {
+        PsdError::InvalidFormat(format!("Too many layers: {count} (max {})", i16::MAX))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -779,7 +782,7 @@ pub(crate) fn write_nested_layer_info_block(
         .map(|layer| prepare_layer_channels(layer, bits_per_channel, &options))
         .collect::<Result<Vec<PreparedLayerChannels>>>()?;
 
-    writer.write_i16(flattened.len() as i16)?;
+    writer.write_i16(layer_count_i16(flattened.len())?)?;
     for (layer, prepared) in flattened.iter().zip(prepared_payloads.iter()) {
         write_layer_record(writer, layer, prepared, &options)?;
     }
@@ -1484,6 +1487,19 @@ mod tests {
         let mut writer = PsdWriter::with_default_capacity();
         writer.write_signature("8BPS").unwrap();
         assert_eq!(writer.get_buffer(), b"8BPS");
+    }
+
+    #[test]
+    fn zero_capacity_writer_does_not_hang() {
+        let mut writer = PsdWriter::new(0);
+        writer.write_u8(42).unwrap();
+        assert_eq!(writer.get_buffer(), &[42]);
+    }
+
+    #[test]
+    fn layer_count_over_i16_max_errors() {
+        assert!(layer_count_i16(40_000).is_err());
+        assert_eq!(layer_count_i16(3).unwrap(), 3);
     }
 
     #[test]
