@@ -824,9 +824,9 @@ fn read_layer_channel_image_data<R: Read + Seek>(
                 let mut byte_counts = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
                     let v = if reader.large {
-                        reader.read_u32()? as u16
+                        reader.read_u32()?
                     } else {
-                        reader.read_u16()?
+                        reader.read_u16()? as u32
                     };
                     byte_counts.push(v);
                 }
@@ -1018,9 +1018,9 @@ fn read_layer_channel_raw_data<R: Read + Seek>(
                 let mut byte_counts = Vec::with_capacity(row_count);
                 for _ in 0..row_count {
                     let v = if reader.large {
-                        reader.read_u32()? as u16
+                        reader.read_u32()?
                     } else {
-                        reader.read_u16()?
+                        reader.read_u16()? as u32
                     };
                     byte_counts.push(v);
                 }
@@ -1263,9 +1263,9 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             let mut byte_counts = Vec::with_capacity(row_count);
             for _ in 0..row_count {
                 let v = if reader.large {
-                    reader.read_u32()? as u16
+                    reader.read_u32()?
                 } else {
-                    reader.read_u16()?
+                    reader.read_u16()? as u32
                 };
                 byte_counts.push(v);
             }

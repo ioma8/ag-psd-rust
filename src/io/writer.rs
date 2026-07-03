@@ -808,6 +808,7 @@ fn write_image_data(
 ) -> Result<()> {
     let bits_per_channel = psd.bits_per_channel.unwrap_or(8);
     let compression = preferred_channel_compression(bits_per_channel, options);
+    let psb = options.psb.unwrap_or(false);
     writer.write_u16(compression as u16)?;
 
     let fallback_width = psd.width as usize;
@@ -841,18 +842,21 @@ fn write_image_data(
                 let raw = extract_channel_data_from_rgba(image_data, width, height, offset);
                 let expanded = expand_samples_for_depth(&raw, bits_per_channel);
                 let row_bytes = width * bytes_per_sample(bits_per_channel);
-                let compressed = compression::compress_rle(&expanded, row_bytes, height)?;
-                compressed_channels.push(compressed);
+                compressed_channels.push(compression::compress_rle_rows(&expanded, row_bytes, height)?);
             }
 
             // PSD composite RLE stores all row byte-counts first, then compressed row data.
-            for channel in &compressed_channels {
-                let table_len = height * 2;
-                writer.write_bytes(&channel[..table_len])?;
+            for (counts, _) in &compressed_channels {
+                for count in counts {
+                    if psb {
+                        writer.write_u32(*count)?;
+                    } else {
+                        writer.write_u16(*count as u16)?;
+                    }
+                }
             }
-            for channel in &compressed_channels {
-                let table_len = height * 2;
-                writer.write_bytes(&channel[table_len..])?;
+            for (_, rows) in &compressed_channels {
+                writer.write_bytes(rows)?;
             }
         }
         Compression::ZipWithoutPrediction => {
@@ -934,7 +938,7 @@ fn layer_channel_payload(
         Compression::RawData => Ok(expanded),
         Compression::RleCompressed => {
             let row_bytes = width * bytes_per_sample(bits_per_channel);
-            compression::compress_rle(&expanded, row_bytes, height)
+            compression::compress_rle(&expanded, row_bytes, height, options.psb.unwrap_or(false))
         }
         Compression::ZipWithoutPrediction => compression::compress_zip(&expanded),
         Compression::ZipWithPrediction => compression::compress_zip_with_prediction(
@@ -962,7 +966,12 @@ fn prepare_layer_channels(
                     Compression::RawData => raw,
                     Compression::RleCompressed => {
                         let row_bytes = width * bytes_per_sample(bits_per_channel);
-                        compression::compress_rle(&raw, row_bytes, height)?
+                        compression::compress_rle(
+                            &raw,
+                            row_bytes,
+                            height,
+                            layer.raw_data.as_ref().map(|raw| raw.large).unwrap_or(options.psb.unwrap_or(false)),
+                        )?
                     }
                     Compression::ZipWithoutPrediction => compression::compress_zip(&raw)?,
                     Compression::ZipWithPrediction => compression::compress_zip_with_prediction(

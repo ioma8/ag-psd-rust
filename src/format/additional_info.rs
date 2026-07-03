@@ -711,7 +711,7 @@ impl<R: Read + Seek> PsdReader<R> {
         if compression == 1 {
             let mut row_lengths = Vec::with_capacity(height);
             for _ in 0..height {
-                row_lengths.push(self.read_u16()?);
+                row_lengths.push(self.read_u16()? as u32);
             }
             let encoded_length = remaining.saturating_sub(height * 2);
             let encoded = self.read_bytes(encoded_length)?;
@@ -1316,10 +1316,10 @@ impl<R: Read + Seek> PsdReader<R> {
                                             // PackBits: row-length table (u16 per row) then data
                                             let row_table_bytes = height * 2;
                                             if slot_bytes.len() >= 2 + row_table_bytes {
-                                                let row_lengths: Vec<u16> = slot_bytes
+                                                let row_lengths: Vec<u32> = slot_bytes
                                                     [2..2 + row_table_bytes]
                                                     .chunks_exact(2)
-                                                    .map(|b| u16::from_be_bytes([b[0], b[1]]))
+                                                    .map(|b| u16::from_be_bytes([b[0], b[1]]) as u32)
                                                     .collect();
                                                 let encoded = &slot_bytes[2 + row_table_bytes..];
                                                 let mut out = vec![0u8; output_size];
@@ -2337,7 +2337,7 @@ impl PsdWriter {
             channel_writer.write_i32(height as i32)?;
             channel_writer.write_u16(1)?;
             channel_writer.write_u8(1)?;
-            let encoded = compression::compress_rle(channel_data, width, height)?;
+            let encoded = compression::compress_rle(channel_data, width, height, false)?;
             channel_writer.write_bytes(&encoded)?;
             let bytes = channel_writer.into_buffer();
             self.write_u32(bytes.len() as u32)?;

@@ -17,7 +17,7 @@ pub fn decompress_rle(
     output: &mut [u8],
     _width: usize,
     height: usize,
-    byte_counts: &[u16],
+    byte_counts: &[u32],
 ) -> Result<()> {
     let mut input_pos: usize = 0;
     let mut output_pos: usize = 0;
@@ -94,8 +94,8 @@ pub fn decompress_rle(
 /// Compress data using RLE
 ///
 /// Returns the compressed data with byte counts for each scanline prepended.
-pub fn compress_rle(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>> {
-    let mut result = Vec::new();
+pub fn compress_rle_rows(data: &[u8], width: usize, height: usize) -> Result<(Vec<u32>, Vec<u8>)> {
+    let mut rows = Vec::new();
     let mut byte_counts = Vec::with_capacity(height);
 
     for y in 0..height {
@@ -104,16 +104,26 @@ pub fn compress_rle(data: &[u8], width: usize, height: usize) -> Result<Vec<u8>>
         let row = &data[row_start..row_end];
 
         let compressed_row = compress_rle_row(row)?;
-        byte_counts.push(compressed_row.len() as u16);
-        result.extend_from_slice(&compressed_row);
+        byte_counts.push(compressed_row.len() as u32);
+        rows.extend_from_slice(&compressed_row);
     }
+    Ok((byte_counts, rows))
+}
 
-    // Prepend byte counts
-    let mut output = Vec::with_capacity(byte_counts.len() * 2 + result.len());
+/// Compress data using RLE.
+///
+/// Returns the compressed data with byte counts for each scanline prepended.
+pub fn compress_rle(data: &[u8], width: usize, height: usize, large: bool) -> Result<Vec<u8>> {
+    let (byte_counts, rows) = compress_rle_rows(data, width, height)?;
+    let mut output = Vec::with_capacity(byte_counts.len() * if large { 4 } else { 2 } + rows.len());
     for count in byte_counts {
-        output.extend_from_slice(&count.to_be_bytes());
+        if large {
+            output.extend_from_slice(&count.to_be_bytes());
+        } else {
+            output.extend_from_slice(&(count as u16).to_be_bytes());
+        }
     }
-    output.extend_from_slice(&result);
+    output.extend_from_slice(&rows);
 
     Ok(output)
 }
@@ -333,16 +343,29 @@ mod tests {
     #[test]
     fn test_compress_decompress_rle() {
         let data = vec![1, 1, 1, 2, 3, 4, 5, 5];
-        let compressed = compress_rle(&data, 8, 1).unwrap();
+        let compressed = compress_rle(&data, 8, 1, false).unwrap();
 
         // Skip byte counts (2 bytes for 1 row)
         let byte_count = u16::from_be_bytes([compressed[0], compressed[1]]) as usize;
         let compressed_data = &compressed[2..];
 
         let mut output = vec![0u8; 8];
-        decompress_rle(compressed_data, &mut output, 8, 1, &[byte_count as u16]).unwrap();
+        decompress_rle(compressed_data, &mut output, 8, 1, &[byte_count as u32]).unwrap();
 
         assert_eq!(output, data);
+    }
+
+    #[test]
+    fn compress_rle_large_emits_four_byte_counts() {
+        let data = vec![7u8; 16];
+        let psb = compress_rle(&data, 16, 1, true).unwrap();
+        let count = u32::from_be_bytes(psb[0..4].try_into().unwrap()) as usize;
+        let mut out = vec![0u8; 16];
+        decompress_rle(&psb[4..], &mut out, 16, 1, &[count as u32]).unwrap();
+        assert_eq!(out, data);
+
+        let psd = compress_rle(&data, 16, 1, false).unwrap();
+        assert_eq!(psd.len(), psb.len() - 2);
     }
 
     #[test]

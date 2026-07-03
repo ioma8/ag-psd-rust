@@ -933,6 +933,45 @@ fn psb_write_read_roundtrip() {
 }
 
 #[test]
+fn psb_rle_roundtrip() {
+    let psd = Psd {
+        width: 8,
+        height: 8,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        image_data: Some(PixelData {
+            data: vec![99u8; 8 * 8 * 4],
+            width: 8,
+            height: 8,
+        }),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(8),
+            right: Some(8),
+            image_data: Some(PixelData {
+                data: vec![50u8; 8 * 8 * 4],
+                width: 8,
+                height: 8,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(
+        &psd,
+        &WriteOptions {
+            psb: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(read.children.unwrap()[0].image_data.as_ref().unwrap().data[0], 50);
+    assert_eq!(read.image_data.unwrap().data[0], 99);
+}
+
+#[test]
 fn write_color_roundtrips_raw_color_structures_exactly() {
     let colors = [
         Color::Rgb48 {
@@ -1947,7 +1986,7 @@ fn test_compression_methods() {
     // Test RLE compression (basic test that it doesn't panic)
     let width = 3;
     let height = 3;
-    let compress_result = compress_rle(&data, width, height);
+    let compress_result = compress_rle(&data, width, height, false);
     assert!(compress_result.is_ok());
 }
 

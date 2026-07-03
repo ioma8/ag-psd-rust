@@ -294,7 +294,7 @@ pub fn write_data_rle(
 
     for &offset in offsets {
         if let Some(channel_data) = write_data_raw(data, offset) {
-            let compressed = compression::compress_rle(&channel_data, width, height)?;
+            let compressed = compression::compress_rle(&channel_data, width, height, false)?;
             all_data.extend_from_slice(&compressed);
         }
     }

@@ -272,14 +272,14 @@ mod packbits_parity {
         // Encoded: header 0x02 = 3 literal bytes: 0x11, 0x22, 0x33
         let encoded = vec![0x02, 0x11, 0x22, 0x33];
         let mut output = vec![0u8; 3];
-        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u16]).unwrap();
+        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u32]).unwrap();
         assert_eq!(output, vec![0x11, 0x22, 0x33]);
     }
 
     #[test]
     fn encode_literal_runs() {
         let input = vec![0x11, 0x22, 0x33];
-        let compressed = compress_rle(&input, 3, 1).unwrap();
+        let compressed = compress_rle(&input, 3, 1, false).unwrap();
         // PackBits row: [row_len_hi, row_len_lo] + [0x02, 0x11, 0x22, 0x33]
         assert_eq!(&compressed[2..], &[0x02, 0x11, 0x22, 0x33]);
     }
@@ -291,7 +291,7 @@ mod packbits_parity {
         // 254 = 0xFE → 257-254 = 3 repeats
         let encoded = vec![0xFE, 0x42];
         let mut output = vec![0u8; 3];
-        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u16]).unwrap();
+        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u32]).unwrap();
         assert_eq!(output, vec![0x42, 0x42, 0x42]);
     }
 }
