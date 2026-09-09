@@ -20,12 +20,23 @@ fn samples_dir() -> std::path::PathBuf {
         .join("photoshop/psd/samples")
         .canonicalize()
         .unwrap_or_else(|_| {
-            // Fallback: try relative from current dir
-            std::env::current_dir()
-                .unwrap()
-                .join("../photoshop/psd/samples")
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/samples")
                 .canonicalize()
-                .unwrap()
+                .unwrap_or_else(|_| {
+                    // Fallback: try relative from current dir
+                    std::env::current_dir()
+                        .unwrap()
+                        .join("../photoshop/psd/samples")
+                        .canonicalize()
+                        .unwrap_or_else(|_| {
+                            std::env::current_dir()
+                                .unwrap()
+                                .join("tests/fixtures/samples")
+                                .canonicalize()
+                                .unwrap()
+                        })
+                })
         })
 }
 
@@ -134,8 +145,14 @@ mod samples {
                 },
             )
             .expect(&format!("Failed to re-parse: {}", file));
-            let output2 = write_psd(&psd2, &WriteOptions::default())
-                .expect(&format!("Failed to second write: {}", file));
+            let output2 = write_psd(
+                &psd2,
+                &WriteOptions {
+                    overwrite_skipped_composite: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect(&format!("Failed to second write: {}", file));
             let psd3 = read_psd(
                 Cursor::new(&output2),
                 ReadOptions {
@@ -272,7 +289,7 @@ mod packbits_parity {
         // Encoded: header 0x02 = 3 literal bytes: 0x11, 0x22, 0x33
         let encoded = vec![0x02, 0x11, 0x22, 0x33];
         let mut output = vec![0u8; 3];
-        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u32]).unwrap();
+        decompress_rle(&encoded, &mut output, 3, 1, &[encoded.len() as u32]).unwrap();
         assert_eq!(output, vec![0x11, 0x22, 0x33]);
     }
 
@@ -291,7 +308,7 @@ mod packbits_parity {
         // 254 = 0xFE → 257-254 = 3 repeats
         let encoded = vec![0xFE, 0x42];
         let mut output = vec![0u8; 3];
-        decompress_rle(&encoded, &mut output, 1, 1, &[encoded.len() as u32]).unwrap();
+        decompress_rle(&encoded, &mut output, 3, 1, &[encoded.len() as u32]).unwrap();
         assert_eq!(output, vec![0x42, 0x42, 0x42]);
     }
 }
@@ -991,6 +1008,60 @@ mod color_mode_parity {
         let data = psd.image_data.as_ref().unwrap();
         assert_eq!(data.width, 1);
         assert_eq!(data.height, 1);
+    }
+
+    #[test]
+    fn indexed_composite_resolves_palette() {
+        // 1x1 Indexed PSD, palette entry 5 = (10, 20, 30), composite index 5.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"8BPS");
+        bytes.extend_from_slice(&[0x00, 0x01]); // version 1
+        bytes.extend_from_slice(&[0; 6]); // reserved
+        bytes.extend_from_slice(&1u16.to_be_bytes()); // channels
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // height
+        bytes.extend_from_slice(&1u32.to_be_bytes()); // width
+        bytes.extend_from_slice(&8u16.to_be_bytes()); // depth
+        bytes.extend_from_slice(&2u16.to_be_bytes()); // color mode: indexed
+        bytes.extend_from_slice(&768u32.to_be_bytes()); // color mode data length
+                                                        // Palette is stored plane-major: all reds, all greens, all blues.
+        for i in 0..256u16 {
+            bytes.push(if i == 5 { 10 } else { 0 });
+        }
+        for i in 0..256u16 {
+            bytes.push(if i == 5 { 20 } else { 0 });
+        }
+        for i in 0..256u16 {
+            bytes.push(if i == 5 { 30 } else { 0 });
+        }
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // image resources length
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // layer & mask length
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // compression: raw
+        bytes.push(5); // composite index
+        let psd = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+        assert_eq!(psd.color_mode, Some(ColorMode::Indexed));
+        let data = psd.image_data.unwrap().data;
+        assert_eq!(data, vec![10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn indexed_composite_without_palette_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"8BPS");
+        bytes.extend_from_slice(&[0x00, 0x01]);
+        bytes.extend_from_slice(&[0; 6]);
+        bytes.extend_from_slice(&1u16.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&1u32.to_be_bytes());
+        bytes.extend_from_slice(&8u16.to_be_bytes());
+        bytes.extend_from_slice(&2u16.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes()); // missing palette
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        bytes.extend_from_slice(&0u16.to_be_bytes());
+        bytes.push(0);
+
+        let err = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap_err();
+        assert!(err.to_string().contains("palette"));
     }
 
     #[test]

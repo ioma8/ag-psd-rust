@@ -2,6 +2,9 @@
 //!
 //! Provides functionality to read PSD files and parse their structure.
 
+use crate::api::layer::{Layer, LayerMaskData, LayerRawData, LayerRawDataChannel};
+use crate::api::psd::{GlobalLayerMaskInfo, Psd, ReadOptions};
+use crate::api::types::{ChannelID, ColorMode, Compression, PixelData, SectionDividerType};
 use crate::support::binrw_support::{
     decode_be, ChannelInfoRecord, GlobalLayerMaskRecord, LayerBlendRecord, LayerMaskPrefixRecord,
     LayerRecordBounds, PsbChannelInfoRecord, PsdHeaderRecord,
@@ -11,9 +14,6 @@ use crate::support::error::{PsdError, Result};
 use crate::support::helpers::{
     setup_grayscale, to_blend_mode, LayerBlendFlags, LayerMaskParameterFlags, LayerMaskStateBits,
 };
-use crate::api::layer::{Layer, LayerMaskData, LayerRawData, LayerRawDataChannel};
-use crate::api::psd::{GlobalLayerMaskInfo, Psd, ReadOptions};
-use crate::api::types::{ChannelID, ColorMode, Compression, PixelData, SectionDividerType};
 use byteorder::{BigEndian, ReadBytesExt};
 use std::io::{Read, Seek, SeekFrom};
 
@@ -23,7 +23,12 @@ pub struct PsdReader<R: Read + Seek> {
     pub offset: u64,
     pub large: bool,
     pub global_alpha: bool,
+    pub color_mode: Option<ColorMode>,
     pub options: ReadOptions,
+    /// End offset of the innermost `read_section` payload, if any. Primitive
+    /// reads refuse to consume bytes at or past this offset so a handler can
+    /// never overread into sibling data.
+    section_end: Option<u64>,
 }
 
 impl<R: Read + Seek> PsdReader<R> {
@@ -34,12 +39,53 @@ impl<R: Read + Seek> PsdReader<R> {
             offset: 0,
             large: false,
             global_alpha: false,
+            color_mode: None,
             options,
+            section_end: None,
         }
+    }
+
+    /// Validate that reading `extra` more bytes from the current offset stays
+    /// inside the enclosing section payload.
+    fn ensure_within_section(&self, extra: u64) -> Result<()> {
+        if let Some(end) = self.section_end {
+            let new_offset = self
+                .offset
+                .checked_add(extra)
+                .ok_or_else(|| PsdError::InvalidFormat("Section read overflow".to_string()))?;
+            if new_offset > end {
+                return Err(PsdError::InvalidFormat(format!(
+                    "Section overread: offset {} + {} exceeds section end {}",
+                    self.offset, extra, end
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether strict parsing is in effect (`strict` or
+    /// `throw_for_missing_features`).
+    pub(crate) fn strict_enabled(&self) -> bool {
+        self.options.strict.unwrap_or(false)
+            || self.options.throw_for_missing_features.unwrap_or(false)
+    }
+
+    /// Temporarily constrain reads to end at `end`; returns the previous bound
+    /// for later restoration with [`pop_section_bound`].
+    pub(crate) fn push_section_bound(&mut self, end: u64) -> Option<u64> {
+        let previous = self.section_end;
+        self.section_end = Some(end);
+        previous
+    }
+
+    /// Restore a bound previously saved by [`push_section_bound`].
+    pub(crate) fn pop_section_bound(&mut self, previous: Option<u64>) {
+        self.section_end = previous;
     }
 
     /// Read an unsigned 8-bit integer
     pub fn read_u8(&mut self) -> Result<u8> {
+        self.ensure_within_section(1)?;
         let val = self.reader.read_u8()?;
         self.offset += 1;
         Ok(val)
@@ -47,6 +93,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Peek at an unsigned 8-bit integer without advancing
     pub fn peek_u8(&mut self) -> Result<u8> {
+        self.ensure_within_section(1)?;
         let pos = self.reader.stream_position()?;
         let val = self.reader.read_u8()?;
         self.reader.seek(SeekFrom::Start(pos))?;
@@ -55,6 +102,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Peek a 4-character signature without advancing.
     pub fn peek_signature(&mut self) -> Result<String> {
+        self.ensure_within_section(4)?;
         let pos = self.reader.stream_position()?;
         let bytes = self.read_bytes(4)?;
         self.reader.seek(SeekFrom::Start(pos))?;
@@ -64,6 +112,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read a signed 16-bit integer (big-endian)
     pub fn read_i16(&mut self) -> Result<i16> {
+        self.ensure_within_section(2)?;
         let val = self.reader.read_i16::<BigEndian>()?;
         self.offset += 2;
         Ok(val)
@@ -71,6 +120,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read an unsigned 16-bit integer (big-endian)
     pub fn read_u16(&mut self) -> Result<u16> {
+        self.ensure_within_section(2)?;
         let val = self.reader.read_u16::<BigEndian>()?;
         self.offset += 2;
         Ok(val)
@@ -78,6 +128,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read a signed 32-bit integer (big-endian)
     pub fn read_i32(&mut self) -> Result<i32> {
+        self.ensure_within_section(4)?;
         let val = self.reader.read_i32::<BigEndian>()?;
         self.offset += 4;
         Ok(val)
@@ -85,6 +136,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read an unsigned 32-bit integer (big-endian)
     pub fn read_u32(&mut self) -> Result<u32> {
+        self.ensure_within_section(4)?;
         let val = self.reader.read_u32::<BigEndian>()?;
         self.offset += 4;
         Ok(val)
@@ -92,6 +144,7 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read a 32-bit float (big-endian)
     pub fn read_f32(&mut self) -> Result<f32> {
+        self.ensure_within_section(4)?;
         let val = self.reader.read_f32::<BigEndian>()?;
         self.offset += 4;
         Ok(val)
@@ -99,36 +152,77 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read a 64-bit float (big-endian)
     pub fn read_f64(&mut self) -> Result<f64> {
+        self.ensure_within_section(8)?;
         let val = self.reader.read_f64::<BigEndian>()?;
         self.offset += 8;
         Ok(val)
     }
 
-    /// Read raw bytes
+    /// Read raw bytes.
+    ///
+    /// The buffer is grown incrementally as data actually arrives rather than
+    /// pre-allocated from the declared length, so a hostile length can never
+    /// trigger a large allocation on a small input. An early EOF is an error.
     pub fn read_bytes(&mut self, length: usize) -> Result<Vec<u8>> {
-        let mut buffer = vec![0u8; length];
-        self.reader.read_exact(&mut buffer)?;
+        self.ensure_within_section(length as u64)?;
+        crate::support::limits::check_decoded_buffer(length, "raw read buffer")?;
+        let mut buffer = Vec::new();
+        let mut remaining = length;
+        let mut chunk = [0u8; 65536];
+        while remaining > 0 {
+            let want = remaining.min(chunk.len());
+            let n = self.reader.read(&mut chunk[..want])?;
+            if n == 0 {
+                return Err(PsdError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "unexpected EOF while reading {} more byte(s) of data",
+                        remaining
+                    ),
+                )));
+            }
+            buffer.extend_from_slice(&chunk[..n]);
+            remaining -= n;
+        }
         self.offset += length as u64;
         Ok(buffer)
     }
 
     /// Skip bytes
     pub fn skip_bytes(&mut self, count: usize) -> Result<()> {
+        self.ensure_within_section(count as u64)?;
         self.reader.seek(SeekFrom::Current(count as i64))?;
         self.offset += count as u64;
         Ok(())
     }
 
     pub(crate) fn seek_to(&mut self, position: u64) -> Result<()> {
+        if let Some(end) = self.section_end {
+            if position > end {
+                return Err(PsdError::InvalidFormat(format!(
+                    "Section seek past end: {} > {}",
+                    position, end
+                )));
+            }
+        }
         self.reader.seek(SeekFrom::Start(position))?;
         self.offset = position;
         Ok(())
     }
 
-    /// Read all remaining bytes to EOF from current offset.
+    /// Read all remaining bytes of the enclosing section (or to EOF when not
+    /// inside a section) from the current offset.
     pub fn read_remaining_bytes(&mut self) -> Result<Vec<u8>> {
         let cur = self.reader.stream_position()?;
-        let end = self.reader.seek(SeekFrom::End(0))?;
+        let end = match self.section_end {
+            Some(section_end) => section_end,
+            None => self.reader.seek(SeekFrom::End(0))?,
+        };
+        if end < cur {
+            return Err(PsdError::InvalidFormat(
+                "Section end precedes current offset".to_string(),
+            ));
+        }
         self.reader.seek(SeekFrom::Start(cur))?;
         let remaining = (end - cur) as usize;
         self.read_bytes(remaining)
@@ -196,10 +290,19 @@ impl<R: Read + Seek> PsdReader<R> {
     }
 
     /// Read a section with length prefix.
+    ///
+    /// The declared payload length is validated against the enclosing section
+    /// and the physical input length, and the handler runs with a hard read
+    /// bound at the payload end, so it can never overread into sibling data.
     pub fn read_section<F, T>(&mut self, round: usize, eight_byte: bool, func: F) -> Result<T>
     where
         F: FnOnce(&mut Self, u64) -> Result<T>,
     {
+        if round == 0 {
+            return Err(PsdError::InvalidFormat(
+                "Section alignment must be non-zero".to_string(),
+            ));
+        }
         let length = if eight_byte {
             let high = self.read_u32()? as usize;
             if high != 0 {
@@ -213,23 +316,44 @@ impl<R: Read + Seek> PsdReader<R> {
         };
 
         let start_offset = self.offset;
-        let end_offset = start_offset + length as u64;
+        let end_offset = start_offset
+            .checked_add(length as u64)
+            .ok_or_else(|| PsdError::InvalidFormat("Section length overflow".to_string()))?;
 
-        let result = func(self, end_offset)?;
+        // The declared payload must not exceed the enclosing section or the
+        // physical input length (a seek past EOF would otherwise only be
+        // noticed later, after sibling data is consumed or lost).
+        self.ensure_within_section(length as u64)?;
+        let physical_end = self.reader.seek(SeekFrom::End(0))?;
+        self.reader.seek(SeekFrom::Start(self.offset))?;
+        if end_offset > physical_end {
+            return Err(PsdError::InvalidFormat(format!(
+                "Section length {} exceeds available input (payload end {} > file end {})",
+                length, end_offset, physical_end
+            )));
+        }
 
-        // Skip to end of section
+        let previous_bound = self.section_end;
+        self.section_end = Some(end_offset);
+        let result = func(self, end_offset);
+        self.section_end = previous_bound;
+        let result = result?;
+
+        // Skip to end of section. The declared payload is bounded, but any
+        // alignment padding after it is not part of the payload.
         if self.offset < end_offset {
             let remaining = (end_offset - self.offset) as usize;
-            self.skip_bytes(remaining)?;
+            self.offset += remaining as u64;
+            self.reader.seek(SeekFrom::Current(remaining as i64))?;
         }
 
         // Section payload is padded to alignment outside the length field.
-        if round > 1 {
-            let mut padded_length = length;
-            while padded_length % round != 0 {
-                self.skip_bytes(1)?;
-                padded_length += 1;
-            }
+        let padding = (round - (length % round)) % round;
+        if padding != 0 {
+            // Read the padding instead of seeking over it: seek permits a
+            // Cursor/file to move past EOF, while read_bytes turns truncated
+            // padding into the required UnexpectedEof error.
+            self.read_bytes(padding)?;
         }
 
         Ok(result)
@@ -298,6 +422,18 @@ impl<R: Read + Seek> PsdReader<R> {
 
 /// Read a PSD file from a reader
 pub fn read_psd<R: Read + Seek>(mut reader: R, options: ReadOptions) -> Result<Psd> {
+    for (name, requested) in [
+        ("log_missing_features", options.log_missing_features),
+        ("log_dev_features", options.log_dev_features),
+        ("debug", options.debug),
+    ] {
+        if requested == Some(true) {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "ReadOptions::{} is not implemented",
+                name
+            )));
+        }
+    }
     let mut psd_reader = PsdReader::new(&mut reader, options);
 
     let header: PsdHeaderRecord = decode_be(&psd_reader.read_bytes(26)?, "PSD header")?;
@@ -361,6 +497,7 @@ pub fn read_psd<R: Read + Seek>(mut reader: R, options: ReadOptions) -> Result<P
     }
 
     let color_mode = ColorMode::from_u16(color_mode)?;
+    psd_reader.color_mode = Some(color_mode);
 
     let mut psd = Psd {
         width,
@@ -370,6 +507,10 @@ pub fn read_psd<R: Read + Seek>(mut reader: R, options: ReadOptions) -> Result<P
         color_mode: Some(color_mode),
         palette: None,
         image_data: None,
+        composite_skipped: false,
+        layer_image_data_skipped: false,
+        linked_files_data_skipped: false,
+        composite_native: None,
         children: None,
         image_resources: None,
         linked_files: None,
@@ -404,17 +545,35 @@ pub fn read_psd<R: Read + Seek>(mut reader: R, options: ReadOptions) -> Result<P
 
     // Read layer and mask information section
     read_layer_and_mask_info(&mut psd_reader, &mut psd)?;
+    if psd_reader.options.skip_layer_image_data.unwrap_or(false) {
+        psd.layer_image_data_skipped = psd
+            .children
+            .as_ref()
+            .map(|layers| !layers.is_empty())
+            .unwrap_or(false);
+    }
+    if psd_reader.options.skip_linked_files_data.unwrap_or(false) {
+        psd.linked_files_data_skipped = psd
+            .additional_info
+            .linked_files
+            .as_ref()
+            .map(|block| block.items.iter().any(|item| item.data.is_none()))
+            .unwrap_or(false);
+    }
 
     // Apply document resource postprocess (after layers are available)
     crate::format::document_resource_postprocess::apply_document_postprocess(&mut psd)?;
 
     // Read image data section
-    if !psd_reader
+    let skip_composite = psd_reader
         .options
         .skip_composite_image_data
         .unwrap_or(false)
-    {
+        || psd_reader.options.use_image_data == Some(false);
+    if !skip_composite {
         read_image_data(&mut psd_reader, &mut psd)?;
+    } else {
+        psd.composite_skipped = true;
     }
 
     Ok(psd)
@@ -471,7 +630,8 @@ fn read_image_resources<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd
     reader.read_section(1, false, |reader, end_offset| {
         let remaining = reader.bytes_left(end_offset) as usize;
         if remaining > 0 {
-            let resources = crate::format::image_resources::read_image_resources(reader, remaining)?;
+            let resources =
+                crate::format::image_resources::read_image_resources(reader, remaining)?;
             // Map descriptor resource 3000 to psd.path_selection_descriptor
             if let Some(descriptor) = resources.descriptor_resources.get(&3000) {
                 psd.path_selection_descriptor = Some(descriptor.clone());
@@ -593,7 +753,13 @@ fn read_layer_record<R: Read + Seek>(
     let blend_sig = String::from_utf8_lossy(&blend.blend_mode).to_string();
     layer.blend_mode = Some(to_blend_mode(&blend_sig)?);
     layer.opacity = Some(blend.opacity as f64 / 255.0);
+    if blend.clipping != 0 {
+        // The layer record carries its own clipping byte; it is not derived
+        // from resource 1026 (which holds dragging-group IDs).
+        layer.clipping = Some(blend.clipping as u16);
+    }
     let blend_flags = LayerBlendFlags::from_bits_retain(blend.flags);
+    layer.raw_blend_flags = Some(blend.flags);
     layer.transparency_protected =
         Some(blend_flags.contains(LayerBlendFlags::TRANSPARENCY_PROTECTED));
     layer.hidden = Some(blend_flags.contains(LayerBlendFlags::HIDDEN));
@@ -601,14 +767,27 @@ fn read_layer_record<R: Read + Seek>(
     // Read extra data
     reader.read_section(1, false, |reader, end_offset| {
         // Read layer mask data
-        let channel_ids: Vec<i16> = channels.iter().map(|c| c.id as i16).collect();
+        let channel_ids: Vec<i16> = channels.iter().map(|c| c.id.as_i16()).collect();
         read_layer_mask_data(reader, &mut layer, &channel_ids)?;
 
         // Read blending ranges
         let blending_len = reader.read_u32()? as usize;
-        if blending_len > 0 && reader.bytes_left(end_offset) >= blending_len {
+        if blending_len > reader.bytes_left(end_offset) {
+            return Err(PsdError::InvalidFormat(format!(
+                "Layer blending ranges length {} exceeds remaining extra data {}",
+                blending_len,
+                reader.bytes_left(end_offset)
+            )));
+        }
+        if blending_len > 0 {
             let bytes = reader.read_bytes(blending_len)?;
-            layer.blending_ranges_data = parse_layer_blending_ranges(&bytes);
+            layer.blending_ranges_data =
+                Some(parse_layer_blending_ranges(&bytes).ok_or_else(|| {
+                    PsdError::InvalidFormat(format!(
+                        "Layer blending ranges length {} is not a multiple of 8",
+                        blending_len
+                    ))
+                })?);
         }
 
         // Read layer name
@@ -619,7 +798,8 @@ fn read_layer_record<R: Read + Seek>(
         if remaining > 0 {
             let existing_mask = layer.additional_info.mask.take();
             let existing_real_mask = layer.additional_info.real_mask.take();
-            let mut info = crate::format::additional_info::read_layer_additional_info(reader, remaining)?;
+            let mut info =
+                crate::format::additional_info::read_layer_additional_info(reader, remaining)?;
             if info.mask.is_none() {
                 info.mask = existing_mask;
             }
@@ -648,9 +828,12 @@ struct ChannelInfo {
 pub(crate) fn read_nested_layer_info_block(
     bytes: &[u8],
     bits_per_channel: u8,
+    large: bool,
+    color_mode: ColorMode,
 ) -> Result<Vec<Layer>> {
     let cursor = std::io::Cursor::new(bytes.to_vec());
     let mut reader = PsdReader::new(cursor, Default::default());
+    reader.large = large;
     let mut layer_count = reader.read_i16()? as i32;
     if layer_count < 0 {
         layer_count = -layer_count;
@@ -664,7 +847,13 @@ pub(crate) fn read_nested_layer_info_block(
         layer_channels.push(channels);
     }
     for (i, channels) in layer_channels.iter().enumerate() {
-        read_layer_channel_raw_data(&mut reader, bits_per_channel, &mut layers[i], channels)?;
+        read_layer_channel_raw_data(
+            &mut reader,
+            bits_per_channel,
+            color_mode,
+            &mut layers[i],
+            channels,
+        )?;
     }
     let mut temp_psd = Psd::default();
     build_layer_hierarchy(&mut temp_psd, layers)?;
@@ -675,7 +864,7 @@ pub(crate) fn read_nested_layer_info_block(
 fn read_layer_mask_data<R: Read + Seek>(
     reader: &mut PsdReader<R>,
     layer: &mut Layer,
-    channel_ids: &[i16],
+    _channel_ids: &[i16],
 ) -> Result<()> {
     reader.read_section(1, false, |reader, end_offset| {
         if reader.bytes_left(end_offset) == 0 {
@@ -700,52 +889,55 @@ fn read_layer_mask_data<R: Read + Seek>(
             ..Default::default()
         };
 
-        // Read remaining mask parameters if present
-        let remaining = reader.bytes_left(end_offset) as usize;
-        if remaining >= 18 {
-            // Check for mask parameters flag (bit 4 in flags byte)
-            if flags.contains(LayerMaskStateBits::HAS_PARAMETERS) {
-                // Real mask fields are only present when channel -3 (RealUserMask) exists
-                let has_real_mask_channel = channel_ids.contains(&-3);
-                if has_real_mask_channel && reader.bytes_left(end_offset) >= 18 {
-                    mask.real_flags_byte = Some(reader.read_u8()?);
-                    mask.real_default_color = Some(reader.read_u8()?);
-                    mask.real_top = Some(reader.read_i32()?);
-                    mask.real_left = Some(reader.read_i32()?);
-                    mask.real_bottom = Some(reader.read_i32()?);
-                    mask.real_right = Some(reader.read_i32()?);
+        // Parameters (if flagged) come first and must be parsed even when the
+        // whole payload is compact (well under the 18 bytes of a real mask);
+        // otherwise valid density/feather-only parameter sets are lost.
+        if flags.contains(LayerMaskStateBits::HAS_PARAMETERS) {
+            if reader.bytes_left(end_offset) < 1 {
+                return Err(PsdError::InvalidFormat(
+                    "Mask parameters flag set but no parameter flags present".to_string(),
+                ));
+            }
+            let param_flags = LayerMaskParameterFlags::from_bits_retain(reader.read_u8()?);
+            if param_flags.contains(LayerMaskParameterFlags::USER_MASK_DENSITY) {
+                if reader.bytes_left(end_offset) < 1 {
+                    return Err(PsdError::InvalidFormat(
+                        "Mask user density declared but missing".to_string(),
+                    ));
                 }
-                let param_flags = LayerMaskParameterFlags::from_bits_retain(reader.read_u8()?);
-                if param_flags.contains(LayerMaskParameterFlags::USER_MASK_DENSITY)
-                    && reader.bytes_left(end_offset) > 0
-                {
-                    mask.user_mask_density = Some(reader.read_u8()? as f64);
+                mask.user_mask_density = Some(reader.read_u8()? as f64);
+            }
+            if param_flags.contains(LayerMaskParameterFlags::USER_MASK_FEATHER) {
+                if reader.bytes_left(end_offset) < 8 {
+                    return Err(PsdError::InvalidFormat(
+                        "Mask user feather declared but missing".to_string(),
+                    ));
                 }
-                if param_flags.contains(LayerMaskParameterFlags::USER_MASK_FEATHER)
-                    && reader.bytes_left(end_offset) >= 8
-                {
-                    mask.user_mask_feather = Some(reader.read_f64()?);
+                mask.user_mask_feather = Some(reader.read_f64()?);
+            }
+            if param_flags.contains(LayerMaskParameterFlags::VECTOR_MASK_DENSITY) {
+                if reader.bytes_left(end_offset) < 1 {
+                    return Err(PsdError::InvalidFormat(
+                        "Mask vector density declared but missing".to_string(),
+                    ));
                 }
-                if param_flags.contains(LayerMaskParameterFlags::VECTOR_MASK_DENSITY)
-                    && reader.bytes_left(end_offset) > 0
-                {
-                    mask.vector_mask_density = Some(reader.read_u8()? as f64);
+                mask.vector_mask_density = Some(reader.read_u8()? as f64);
+            }
+            if param_flags.contains(LayerMaskParameterFlags::VECTOR_MASK_FEATHER) {
+                if reader.bytes_left(end_offset) < 8 {
+                    return Err(PsdError::InvalidFormat(
+                        "Mask vector feather declared but missing".to_string(),
+                    ));
                 }
-                if param_flags.contains(LayerMaskParameterFlags::VECTOR_MASK_FEATHER)
-                    && reader.bytes_left(end_offset) >= 8
-                {
-                    mask.vector_mask_feather = Some(reader.read_f64()?);
-                }
+                mask.vector_mask_feather = Some(reader.read_f64()?);
             }
         }
 
-        // For old format (pre-HAS_PARAMETERS), check if remaining bytes are the real mask
+        // The optional real-mask structure follows the parameters; within
+        // this bounded mask section, 18 trailing bytes are its documented
+        // size, independent of how parameters were laid out.
         let remaining_after_params = reader.bytes_left(end_offset) as usize;
-        if !flags.contains(LayerMaskStateBits::HAS_PARAMETERS)
-            && remaining_after_params >= 18
-            && !channel_ids.contains(&-3)
-        {
-            // Old format: extra bytes are the real mask (only if no -3 channel to avoid over-read)
+        if remaining_after_params >= 18 {
             mask.real_flags_byte = Some(reader.read_u8()?);
             mask.real_default_color = Some(reader.read_u8()?);
             mask.real_top = Some(reader.read_i32()?);
@@ -776,23 +968,61 @@ fn read_layer_channel_image_data<R: Read + Seek>(
         return Ok(());
     }
 
-    let width = (layer.right.unwrap_or(0) - layer.left.unwrap_or(0)).max(0) as usize;
-    let height = (layer.bottom.unwrap_or(0) - layer.top.unwrap_or(0)).max(0) as usize;
-    if width == 0 || height == 0 {
-        for channel in channels {
-            reader.skip_bytes(channel.length as usize)?;
-        }
-        return Ok(());
+    let width = layer
+        .right
+        .unwrap_or(0)
+        .checked_sub(layer.left.unwrap_or(0))
+        .ok_or_else(|| PsdError::InvalidFormat("Layer horizontal bounds overflow".to_string()))?;
+    let height = layer
+        .bottom
+        .unwrap_or(0)
+        .checked_sub(layer.top.unwrap_or(0))
+        .ok_or_else(|| PsdError::InvalidFormat("Layer vertical bounds overflow".to_string()))?;
+    if width < 0 || height < 0 {
+        return Err(PsdError::InvalidFormat(
+            "Layer bounds are reversed".to_string(),
+        ));
     }
+    let width = width as usize;
+    let height = height as usize;
 
-    let expected_len = width * height;
+    let expected_len = width
+        .checked_mul(height)
+        .ok_or_else(|| PsdError::InvalidFormat("Layer image dimensions overflow".to_string()))?;
+    crate::support::limits::check_decoded_buffer(
+        expected_len.checked_mul(4).unwrap_or(usize::MAX),
+        "layer image data",
+    )?;
     let color_mode = psd.color_mode.unwrap_or(ColorMode::RGB);
     let cmyk = color_mode == ColorMode::CMYK;
     let is_grayscale = color_mode == ColorMode::Grayscale;
+    let doc_depth = psd.bits_per_channel.unwrap_or(8);
+    let bytes_per_sample = match doc_depth {
+        8 => 1usize,
+        16 => 2,
+        32 => 4,
+        other => {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "Unsupported layer bits per channel: {}",
+                other
+            )))
+        }
+    };
+    // Native samples are kept when the RGBA preview cannot represent them
+    // losslessly: high-bit-depth layers, non-RGB layers, or explicit request.
+    let capture_native = doc_depth != 8
+        || reader.options.use_raw_data.unwrap_or(false)
+        || !matches!(
+            color_mode,
+            ColorMode::RGB | ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Indexed
+        );
+    let mut native_channels: Vec<LayerRawDataChannel> = Vec::new();
     let mut red: Option<Vec<u8>> = None;
     let mut green: Option<Vec<u8>> = None;
     let mut blue: Option<Vec<u8>> = None;
+    let mut black: Option<Vec<u8>> = None;
     let mut alpha: Option<Vec<u8>> = None;
+    let mut transparency: Option<Vec<u8>> = None;
     let mut user_mask_channel: Option<(Vec<u8>, usize, usize, i32, i32)> = None;
     let mut real_user_mask_channel: Option<(Vec<u8>, usize, usize, i32, i32)> = None;
 
@@ -805,23 +1035,41 @@ fn read_layer_channel_image_data<R: Read + Seek>(
             .ok_or_else(|| PsdError::InvalidFormat("Invalid channel length".to_string()))?
             as usize;
         let (_, _, channel_width, channel_height) = layer_channel_bounds(layer, channel.id);
-        let channel_expected_len = channel_width * channel_height;
+        let channel_samples = channel_width.checked_mul(channel_height).ok_or_else(|| {
+            PsdError::InvalidFormat("Layer channel dimensions overflow".to_string())
+        })?;
+        let channel_expected_len =
+            channel_samples
+                .checked_mul(bytes_per_sample)
+                .ok_or_else(|| {
+                    PsdError::InvalidFormat("Layer channel byte size overflow".to_string())
+                })?;
+        crate::support::limits::check_decoded_buffer(channel_expected_len, "layer channel data")?;
 
         let decoded = match compression {
             Compression::RawData => {
                 let data = reader.read_bytes(data_length)?;
-                normalize_channel_data(data, channel_expected_len)
+                if reader.strict_enabled() && data.len() != channel_expected_len {
+                    return Err(PsdError::InvalidFormat(format!(
+                        "Strict parse: raw channel has {} bytes, expected {}",
+                        data.len(),
+                        channel_expected_len
+                    )));
+                }
+                Ok(normalize_channel_data(data, channel_expected_len))
             }
             Compression::RleCompressed => {
                 let row_count = channel_height;
                 let byte_count_width = if reader.large { 4 } else { 2 };
-                let byte_counts_len = row_count * byte_count_width;
+                let byte_counts_len = row_count.checked_mul(byte_count_width).ok_or_else(|| {
+                    PsdError::InvalidFormat("Layer RLE count table overflow".to_string())
+                })?;
                 if data_length < byte_counts_len {
                     return Err(PsdError::InvalidFormat(
                         "Invalid RLE channel data length".to_string(),
                     ));
                 }
-                let mut byte_counts = Vec::with_capacity(row_count);
+                let mut byte_counts = Vec::new();
                 for _ in 0..row_count {
                     let v = if reader.large {
                         reader.read_u32()?
@@ -836,35 +1084,42 @@ fn read_layer_channel_image_data<R: Read + Seek>(
                 compression::decompress_rle(
                     &compressed,
                     &mut out,
-                    channel_width,
+                    channel_width * bytes_per_sample,
                     channel_height,
                     &byte_counts,
                 )?;
-                out
+                Ok(out)
             }
             Compression::ZipWithoutPrediction => {
                 let compressed = reader.read_bytes(data_length)?;
-                let out = compression::decompress_zip(&compressed, channel_expected_len)?;
-                normalize_channel_data(out, channel_expected_len)
+                compression::decompress_zip(&compressed, channel_expected_len)
             }
             Compression::ZipWithPrediction => {
                 let compressed = reader.read_bytes(data_length)?;
-                let depth = psd.bits_per_channel.unwrap_or(8) as u16;
-                let out = compression::decompress_zip_with_prediction(
+                compression::decompress_zip_with_prediction(
                     &compressed,
                     channel_width,
                     channel_height,
-                    depth,
-                )?;
-                normalize_channel_data(out, channel_expected_len)
+                    doc_depth as u16,
+                )
             }
         };
+        let decoded = decoded?;
+        if capture_native {
+            native_channels.push(LayerRawDataChannel {
+                id: channel.id,
+                compression,
+                data: Some(decoded.clone()),
+            });
+        }
         let offset = channel_offset(channel.id, cmyk);
         match offset {
             0 => red = Some(decoded),
             1 => green = Some(decoded),
             2 => blue = Some(decoded),
+            3 if cmyk => black = Some(decoded),
             3 => alpha = Some(decoded),
+            4 if cmyk => transparency = Some(decoded),
             _ => {
                 let (mask_left, mask_top, mask_width, mask_height) =
                     layer_channel_bounds(layer, channel.id);
@@ -883,16 +1138,60 @@ fn read_layer_channel_image_data<R: Read + Seek>(
         }
     }
 
+    if capture_native {
+        layer.raw_data = Some(LayerRawData {
+            color_mode,
+            bits_per_channel: doc_depth,
+            channels: native_channels,
+            large: reader.large,
+            preview: None,
+        });
+    }
+
     let mut rgba = vec![0u8; expected_len * 4];
     for i in 0..expected_len {
-        rgba[i * 4] = red.as_ref().and_then(|d| d.get(i)).copied().unwrap_or(0);
-        rgba[i * 4 + 1] = green.as_ref().and_then(|d| d.get(i)).copied().unwrap_or(0);
-        rgba[i * 4 + 2] = blue.as_ref().and_then(|d| d.get(i)).copied().unwrap_or(0);
-        rgba[i * 4 + 3] = alpha
-            .as_ref()
-            .and_then(|d| d.get(i))
-            .copied()
-            .unwrap_or(255);
+        if cmyk {
+            let c = red
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0) as u16;
+            let m = green
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0) as u16;
+            let y = blue
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0) as u16;
+            let k = black
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0) as u16;
+            rgba[i * 4] = ((255 * (255 - c) * (255 - k)) / (255 * 255)) as u8;
+            rgba[i * 4 + 1] = ((255 * (255 - m) * (255 - k)) / (255 * 255)) as u8;
+            rgba[i * 4 + 2] = ((255 * (255 - y) * (255 - k)) / (255 * 255)) as u8;
+            rgba[i * 4 + 3] = transparency
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(255);
+        } else {
+            rgba[i * 4] = red
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0);
+            rgba[i * 4 + 1] = green
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0);
+            rgba[i * 4 + 2] = blue
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(0);
+            rgba[i * 4 + 3] = alpha
+                .as_ref()
+                .map(|d| sample_to_u8(d, i, doc_depth as u16))
+                .unwrap_or(255);
+        }
     }
 
     let mut pixel_data = PixelData {
@@ -903,56 +1202,10 @@ fn read_layer_channel_image_data<R: Read + Seek>(
     if is_grayscale {
         setup_grayscale(&mut pixel_data);
     }
-
-    if let Some((mask_data, mask_width, mask_height, mask_left, mask_top)) =
-        user_mask_channel.as_ref()
-    {
-        let layer_left = layer.left.unwrap_or(0);
-        let layer_top = layer.top.unwrap_or(0);
-        let rel_left = *mask_left - layer_left;
-        let rel_top = *mask_top - layer_top;
-
-        for mask_y in 0..*mask_height {
-            for mask_x in 0..*mask_width {
-                let target_x = rel_left + mask_x as i32;
-                let target_y = rel_top + mask_y as i32;
-                if target_x < 0
-                    || target_y < 0
-                    || target_x >= width as i32
-                    || target_y >= height as i32
-                {
-                    continue;
-                }
-                let mask_index = mask_y * *mask_width + mask_x;
-                let target_index = ((target_y as usize) * width + target_x as usize) * 4 + 3;
-                pixel_data.data[target_index] = pixel_data.data[target_index].min(mask_data[mask_index]);
-            }
-        }
-    } else if let Some((mask_data, mask_width, mask_height, mask_left, mask_top)) =
-        real_user_mask_channel.as_ref()
-    {
-        let layer_left = layer.left.unwrap_or(0);
-        let layer_top = layer.top.unwrap_or(0);
-        let rel_left = *mask_left - layer_left;
-        let rel_top = *mask_top - layer_top;
-
-        for mask_y in 0..*mask_height {
-            for mask_x in 0..*mask_width {
-                let target_x = rel_left + mask_x as i32;
-                let target_y = rel_top + mask_y as i32;
-                if target_x < 0
-                    || target_y < 0
-                    || target_x >= width as i32
-                    || target_y >= height as i32
-                {
-                    continue;
-                }
-                let mask_index = mask_y * *mask_width + mask_x;
-                let target_index = ((target_y as usize) * width + target_x as usize) * 4 + 3;
-                pixel_data.data[target_index] = pixel_data.data[target_index].min(mask_data[mask_index]);
-            }
-        }
-    }
+    // Masks are preserved as independent channels (attached below to
+    // additional_info.mask/real_mask.image_data). Parsing never bakes them
+    // into the layer's alpha, and a disabled or partially covering mask must
+    // not alter the underlying pixel samples.
 
     if let Some((mask_data, mask_width, mask_height, _, _)) = user_mask_channel {
         let mask_pixel_data = PixelData {
@@ -977,16 +1230,35 @@ fn read_layer_channel_image_data<R: Read + Seek>(
         real_mask.image_data = Some(mask_pixel_data);
     }
 
-    layer.image_data = Some(pixel_data);
+    if expected_len > 0 {
+        layer.image_data = Some(pixel_data);
+    }
+    // The raw channels captured above are only reusable while this preview is
+    // unchanged; snapshot it so the writer can honor later edits.
+    if let Some(raw) = layer.raw_data.as_mut() {
+        raw.preview = layer.image_data.clone();
+    }
     Ok(())
 }
 
 fn read_layer_channel_raw_data<R: Read + Seek>(
     reader: &mut PsdReader<R>,
     bits_per_channel: u8,
+    color_mode: ColorMode,
     layer: &mut Layer,
     channels: &[ChannelInfo],
 ) -> Result<()> {
+    let bytes_per_sample = match bits_per_channel {
+        8 => 1usize,
+        16 => 2,
+        32 => 4,
+        _ => {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "Unsupported layer bits per channel: {}",
+                bits_per_channel
+            )))
+        }
+    };
     let mut raw_channels = Vec::with_capacity(channels.len());
     for channel in channels {
         let compression = reader.read_u16()?;
@@ -997,25 +1269,27 @@ fn read_layer_channel_raw_data<R: Read + Seek>(
             .ok_or_else(|| PsdError::InvalidFormat("Invalid channel length".to_string()))?
             as usize;
         let (_, _, channel_width, channel_height) = layer_channel_bounds(layer, channel.id);
-        let bytes_per_sample = match bits_per_channel {
-            8 => 1,
-            16 => 2,
-            32 => 4,
-            _ => 1,
-        };
-        let expected_len = channel_width * channel_height * bytes_per_sample;
+        let expected_len = channel_width
+            .checked_mul(channel_height)
+            .and_then(|v| v.checked_mul(bytes_per_sample))
+            .ok_or_else(|| {
+                PsdError::InvalidFormat("Layer channel dimensions overflow".to_string())
+            })?;
+        crate::support::limits::check_decoded_buffer(expected_len, "layer raw channel data")?;
         let decoded = match compression {
             Compression::RawData => reader.read_bytes(data_length)?,
             Compression::RleCompressed => {
                 let row_count = channel_height;
                 let byte_count_width = if reader.large { 4 } else { 2 };
-                let byte_counts_len = row_count * byte_count_width;
+                let byte_counts_len = row_count.checked_mul(byte_count_width).ok_or_else(|| {
+                    PsdError::InvalidFormat("Layer RLE count table overflow".to_string())
+                })?;
                 if data_length < byte_counts_len {
                     return Err(PsdError::InvalidFormat(
                         "Invalid RLE channel data length".to_string(),
                     ));
                 }
-                let mut byte_counts = Vec::with_capacity(row_count);
+                let mut byte_counts = Vec::new();
                 for _ in 0..row_count {
                     let v = if reader.large {
                         reader.read_u32()?
@@ -1057,18 +1331,25 @@ fn read_layer_channel_raw_data<R: Read + Seek>(
         });
     }
     layer.raw_data = Some(LayerRawData {
-        color_mode: ColorMode::RGB,
+        color_mode,
         bits_per_channel,
         channels: raw_channels,
         large: reader.large,
+        preview: None,
     });
     Ok(())
 }
 
-/// Build layer hierarchy from flat layer list
+/// Build layer hierarchy from flat layer list.
+///
+/// The folder start marker (open/closed divider) is the group's public node:
+/// it carries the group name, opacity, visibility, blend mode, masks and
+/// effects. Children are attached to it when its bounding closing marker is
+/// reached, and empty groups keep `Some(vec![])`.
 fn build_layer_hierarchy(psd: &mut Psd, layers: Vec<Layer>) -> Result<()> {
-    let mut stack: Vec<(Vec<Layer>, Option<bool>, Option<String>)> =
-        vec![(Vec::new(), None, None)];
+    // Bottom of stack is the root; each folder frame holds the marker record
+    // that will become the public group node plus its accumulated children.
+    let mut stack: Vec<(Option<Layer>, Vec<Layer>)> = vec![(None, Vec::new())];
 
     for mut layer in layers.into_iter().rev() {
         let section_type = layer
@@ -1080,38 +1361,49 @@ fn build_layer_hierarchy(psd: &mut Psd, layers: Vec<Layer>) -> Result<()> {
 
         match section_type {
             SectionDividerType::BoundingSectionDivider => {
-                let (children, opened, close_name) = if stack.len() > 1 {
-                    stack.pop().unwrap()
-                } else {
-                    (Vec::new(), None, None)
-                };
-                if !children.is_empty() {
-                    layer.children = Some(children);
+                if stack.len() <= 1 {
+                    return Err(PsdError::InvalidFormat(
+                        "Bounding section divider without an open folder".to_string(),
+                    ));
                 }
-                layer.opened = opened;
-                if let Some(ref name) = layer.additional_info.name {
-                    if name.starts_with("</") {
-                        if let Some(close_name) = close_name {
-                            layer.additional_info.name = Some(close_name);
-                        }
-                    }
-                }
-                stack.last_mut().unwrap().0.insert(0, layer);
+                let (folder, mut children) = stack.pop().unwrap();
+                // Records arrived reversed; restore their original order once.
+                children.reverse();
+                let mut group = folder.ok_or_else(|| {
+                    PsdError::InvalidFormat("Empty folder frame in hierarchy".to_string())
+                })?;
+                group.children = Some(children);
+                group.opened = Some(matches!(
+                    group
+                        .additional_info
+                        .section_divider
+                        .as_ref()
+                        .map(|sd| sd.divider_type)
+                        .unwrap_or(SectionDividerType::Other),
+                    SectionDividerType::OpenFolder
+                ));
+                stack.last_mut().unwrap().1.push(group);
             }
             SectionDividerType::OpenFolder | SectionDividerType::ClosedFolder => {
-                stack.push((
-                    Vec::new(),
-                    Some(matches!(section_type, SectionDividerType::OpenFolder)),
-                    layer.additional_info.name.clone(),
-                ));
+                // The marker record is the group; children accumulate on top.
+                layer.opened = Some(matches!(section_type, SectionDividerType::OpenFolder));
+                stack.push((Some(layer), Vec::new()));
             }
             SectionDividerType::Other => {
-                stack.last_mut().unwrap().0.insert(0, layer);
+                stack.last_mut().unwrap().1.push(layer);
             }
         }
     }
 
-    psd.children = Some(stack.pop().map(|(layers, _, _)| layers).unwrap_or_default());
+    if stack.len() != 1 {
+        return Err(PsdError::InvalidFormat(format!(
+            "Unbalanced folder markers: {} folder(s) never closed",
+            stack.len() - 1
+        )));
+    }
+    let mut root = stack.pop().map(|(_, layers)| layers).unwrap_or_default();
+    root.reverse();
+    psd.children = Some(root);
     Ok(())
 }
 
@@ -1128,12 +1420,7 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
                 let top = mask.top.unwrap_or(layer_top);
                 let right = mask.right.unwrap_or(left);
                 let bottom = mask.bottom.unwrap_or(top);
-                return (
-                    left,
-                    top,
-                    (right - left).max(0) as usize,
-                    (bottom - top).max(0) as usize,
-                );
+                return (left, top, extent(left, right), extent(top, bottom));
             }
         }
         ChannelID::RealUserMask => {
@@ -1142,24 +1429,14 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
                 let top = mask.top.unwrap_or(layer_top);
                 let right = mask.right.unwrap_or(left);
                 let bottom = mask.bottom.unwrap_or(top);
-                return (
-                    left,
-                    top,
-                    (right - left).max(0) as usize,
-                    (bottom - top).max(0) as usize,
-                );
+                return (left, top, extent(left, right), extent(top, bottom));
             }
             if let Some(mask) = layer.additional_info.mask.as_ref() {
                 let left = mask.real_left.or(mask.left).unwrap_or(layer_left);
                 let top = mask.real_top.or(mask.top).unwrap_or(layer_top);
                 let right = mask.real_right.or(mask.right).unwrap_or(left);
                 let bottom = mask.real_bottom.or(mask.bottom).unwrap_or(top);
-                return (
-                    left,
-                    top,
-                    (right - left).max(0) as usize,
-                    (bottom - top).max(0) as usize,
-                );
+                return (left, top, extent(left, right), extent(top, bottom));
             }
         }
         _ => {}
@@ -1168,9 +1445,21 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
     (
         layer_left,
         layer_top,
-        (layer_right - layer_left).max(0) as usize,
-        (layer_bottom - layer_top).max(0) as usize,
+        layer_right
+            .checked_sub(layer_left)
+            .filter(|value| *value >= 0)
+            .unwrap_or(0) as usize,
+        layer_bottom
+            .checked_sub(layer_top)
+            .filter(|value| *value >= 0)
+            .unwrap_or(0) as usize,
     )
+}
+
+fn extent(start: i32, end: i32) -> usize {
+    end.checked_sub(start)
+        .filter(|value| *value >= 0)
+        .unwrap_or(0) as usize
 }
 
 /// Read global layer mask info
@@ -1224,6 +1513,10 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
         )));
     }
     let channel_len = width * height;
+    crate::support::limits::check_decoded_buffer(
+        channel_len.checked_mul(4).unwrap_or(usize::MAX),
+        "composite image data",
+    )?;
     let base_channels = match color_mode {
         ColorMode::Grayscale => 1usize,
         ColorMode::CMYK => 4usize,
@@ -1233,9 +1526,9 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
     if total_channels == 0 {
         total_channels = base_channels;
     }
-    if reader.global_alpha && total_channels == base_channels {
-        total_channels += 1;
-    }
+    // The header channel count is authoritative. The negative layer-count
+    // transparency marker describes layer data; it does not add a composite
+    // plane to the image-data section.
     let bits_per_channel = psd.bits_per_channel.unwrap_or(8) as u16;
     let bytes_per_sample = match bits_per_channel {
         8 => 1usize,
@@ -1248,7 +1541,10 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             )))
         }
     };
-    let channel_len_bytes = channel_len * bytes_per_sample;
+    let channel_len_bytes = channel_len
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| PsdError::InvalidFormat("Composite channel size overflow".to_string()))?;
+    crate::support::limits::check_decoded_buffer(channel_len_bytes, "composite channel")?;
 
     let mut planes: Vec<Vec<u8>> = vec![Vec::new(); total_channels];
     match compression {
@@ -1259,8 +1555,10 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             }
         }
         Compression::RleCompressed => {
-            let row_count = total_channels * height;
-            let mut byte_counts = Vec::with_capacity(row_count);
+            let row_count = total_channels.checked_mul(height).ok_or_else(|| {
+                PsdError::InvalidFormat("Composite RLE row count overflow".to_string())
+            })?;
+            let mut byte_counts = Vec::new();
             for _ in 0..row_count {
                 let v = if reader.large {
                     reader.read_u32()?
@@ -1290,15 +1588,14 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             let compressed = reader.read_remaining_bytes()?;
             let expected_total = channel_len_bytes * total_channels;
             let mut data = compression::decompress_zip(&compressed, expected_total)?;
-            data = normalize_channel_data(data, expected_total);
             if compression == Compression::ZipWithPrediction {
-                reverse_prediction_planar(
+                compression::reverse_prediction_planar(
                     &mut data,
                     width,
                     height,
                     total_channels,
                     bits_per_channel,
-                );
+                )?;
             }
             for (idx, plane) in planes.iter_mut().enumerate() {
                 let start = idx * channel_len_bytes;
@@ -1315,7 +1612,7 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             match color_mode {
                 ColorMode::CMYK => match channel_idx {
                     0 | 1 | 2 | 3 => {}
-                    4 => rgba[i * 4 + 3] = 255u8.saturating_sub(value),
+                    4 => rgba[i * 4 + 3] = value,
                     _ => {}
                 },
                 ColorMode::Grayscale => match channel_idx {
@@ -1333,17 +1630,67 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
             }
         }
         if color_mode == ColorMode::CMYK {
-            let c = planes.get(0).and_then(|p| p.get(i)).copied().unwrap_or(0) as u32;
-            let m = planes.get(1).and_then(|p| p.get(i)).copied().unwrap_or(0) as u32;
-            let y = planes.get(2).and_then(|p| p.get(i)).copied().unwrap_or(0) as u32;
-            let k = planes.get(3).and_then(|p| p.get(i)).copied().unwrap_or(0) as u32;
+            let c = sample_to_u8(
+                planes.get(0).map(Vec::as_slice).unwrap_or(&[]),
+                i,
+                bits_per_channel,
+            ) as u32;
+            let m = sample_to_u8(
+                planes.get(1).map(Vec::as_slice).unwrap_or(&[]),
+                i,
+                bits_per_channel,
+            ) as u32;
+            let y = sample_to_u8(
+                planes.get(2).map(Vec::as_slice).unwrap_or(&[]),
+                i,
+                bits_per_channel,
+            ) as u32;
+            let k = sample_to_u8(
+                planes.get(3).map(Vec::as_slice).unwrap_or(&[]),
+                i,
+                bits_per_channel,
+            ) as u32;
             rgba[i * 4] = ((255 * (255 - c) * (255 - k)) / (255 * 255)) as u8;
             rgba[i * 4 + 1] = ((255 * (255 - m) * (255 - k)) / (255 * 255)) as u8;
             rgba[i * 4 + 2] = ((255 * (255 - y) * (255 - k)) / (255 * 255)) as u8;
             if total_channels <= 4 {
                 rgba[i * 4 + 3] = 255;
             }
-        } else if total_channels <= 3 {
+        } else if match color_mode {
+            // Force-opaque only when no real transparency plane was decoded:
+            // Grayscale has an alpha plane from channel 2 onward, CMYK from
+            // channel 5 onward, other modes from channel 4 onward.
+            ColorMode::Grayscale => total_channels <= 1,
+            ColorMode::CMYK => total_channels <= 4,
+            _ => total_channels <= 3,
+        } {
+            rgba[i * 4 + 3] = 255;
+        }
+    }
+    if color_mode == ColorMode::Indexed {
+        // Composite indices resolve through the color palette instead of
+        // being treated as an RGB component.
+        let indices = planes.first().map(|p| p.as_slice()).unwrap_or(&[]);
+        let palette = psd.palette.as_deref().ok_or_else(|| {
+            PsdError::InvalidFormat(
+                "Indexed composite is missing its 256-entry palette".to_string(),
+            )
+        })?;
+        if palette.is_empty() {
+            return Err(PsdError::InvalidFormat(
+                "Indexed composite has an empty palette".to_string(),
+            ));
+        }
+        for i in 0..channel_len {
+            let idx = indices
+                .get(i)
+                .copied()
+                .unwrap_or(0)
+                .min(palette.len().saturating_sub(1) as u8);
+            let entry = &palette[idx as usize];
+            rgba[i * 4] = entry.r;
+            rgba[i * 4 + 1] = entry.g;
+            rgba[i * 4 + 2] = entry.b;
             rgba[i * 4 + 3] = 255;
         }
     }
@@ -1360,69 +1707,20 @@ fn read_image_data<R: Read + Seek>(reader: &mut PsdReader<R>, psd: &mut Psd) -> 
     // Removing white matte is intentionally omitted to match TS behavior.
     psd.image_data = Some(pixel_data);
 
-    Ok(())
-}
+    // Keep the original native planes for byte-identical unchanged resaves.
+    let preview = psd
+        .image_data
+        .as_ref()
+        .map(|p| p.data.clone())
+        .unwrap_or_default();
+    psd.composite_native = Some(crate::api::psd::CompositeNativeData {
+        bits_per_channel,
+        color_mode,
+        channels: planes,
+        preview,
+    });
 
-fn reverse_prediction_planar(
-    data: &mut [u8],
-    width: usize,
-    height: usize,
-    channels: usize,
-    depth: u16,
-) {
-    let bytes_per_sample = match depth {
-        8 => 1usize,
-        16 => 2,
-        32 => 4,
-        _ => return,
-    };
-    let plane_len = width * height * bytes_per_sample;
-    for channel in 0..channels {
-        let plane_start = channel * plane_len;
-        match depth {
-            8 => {
-                for row in 0..height {
-                    let row_start = plane_start + row * width;
-                    for x in 1..width {
-                        let pos = row_start + x;
-                        data[pos] = data[pos].wrapping_add(data[pos - 1]);
-                    }
-                }
-            }
-            16 => {
-                let row_bytes = width * 2;
-                for row in 0..height {
-                    let start = plane_start + row * row_bytes;
-                    for i in start + 1..start + row_bytes {
-                        data[i] = data[i].wrapping_add(data[i - 1]);
-                    }
-                }
-            }
-            32 => {
-                let row_bytes = width * 4;
-                let mut reordered = vec![0u8; row_bytes];
-                for row in 0..height {
-                    let row_off = plane_start + row * row_bytes;
-                    reordered.copy_from_slice(&data[row_off..row_off + row_bytes]);
-                    for plane in 0..4usize {
-                        let base = plane * width;
-                        for i in 1..width {
-                            reordered[base + i] =
-                                reordered[base + i].wrapping_add(reordered[base + i - 1]);
-                        }
-                    }
-                    for pixel in 0..width {
-                        let dst = row_off + pixel * 4;
-                        data[dst] = reordered[pixel];
-                        data[dst + 1] = reordered[width + pixel];
-                        data[dst + 2] = reordered[width * 2 + pixel];
-                        data[dst + 3] = reordered[width * 3 + pixel];
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    Ok(())
 }
 
 fn sample_to_u8(channel: &[u8], index: usize, depth: u16) -> u8 {
@@ -1470,6 +1768,9 @@ fn channel_offset(id: ChannelID, cmyk: bool) -> i32 {
             }
         }
         ChannelID::UserMask | ChannelID::RealUserMask => -1,
+        // Extra/saved channels are not color planes; keep them off the RGBA
+        // offsets so they cannot overwrite a valid channel.
+        ChannelID::Other(_) => -2,
     }
 }
 
@@ -1488,25 +1789,30 @@ fn parse_layer_blending_ranges(bytes: &[u8]) -> Option<crate::api::layer::LayerB
     if bytes.is_empty() {
         return None;
     }
+    // Each range pair is 8 bytes: four u16 (big-endian) endpoints covering
+    // source black/white and destination black/white.
+    if bytes.len() % 8 != 0 {
+        return None;
+    }
     let mut offset = 0;
-    let read_pair =
-        |buf: &[u8], offset: &mut usize| -> Option<crate::api::layer::LayerBlendingRangePair> {
-            if *offset + 4 > buf.len() {
-                return None;
-            }
-            let pair = crate::api::layer::LayerBlendingRangePair {
-                src_black: buf[*offset],
-                src_white: buf[*offset + 1],
-                dst_black: buf[*offset + 2],
-                dst_white: buf[*offset + 3],
-            };
-            *offset += 4;
-            Some(pair)
+    let mut read_pair = || -> Option<crate::api::layer::LayerBlendingRangePair> {
+        if offset + 8 > bytes.len() {
+            return None;
+        }
+        let u16_at = |i: usize| u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+        let pair = crate::api::layer::LayerBlendingRangePair {
+            src_black: u16_at(offset),
+            src_white: u16_at(offset + 2),
+            dst_black: u16_at(offset + 4),
+            dst_white: u16_at(offset + 6),
         };
+        offset += 8;
+        Some(pair)
+    };
 
-    let composite_gray = read_pair(bytes, &mut offset);
+    let composite_gray = read_pair();
     let mut channels = Vec::new();
-    while let Some(pair) = read_pair(bytes, &mut offset) {
+    while let Some(pair) = read_pair() {
         channels.push(pair);
     }
 
@@ -1551,11 +1857,22 @@ mod tests {
             .join("photoshop/psd/samples")
             .canonicalize()
             .unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .unwrap()
-                    .join("../photoshop/psd/samples")
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/samples")
                     .canonicalize()
-                    .unwrap()
+                    .unwrap_or_else(|_| {
+                        std::env::current_dir()
+                            .unwrap()
+                            .join("../photoshop/psd/samples")
+                            .canonicalize()
+                            .unwrap_or_else(|_| {
+                                std::env::current_dir()
+                                    .unwrap()
+                                    .join("tests/fixtures/samples")
+                                    .canonicalize()
+                                    .unwrap()
+                            })
+                    })
             })
     }
 
@@ -1657,6 +1974,80 @@ mod tests {
         assert_eq!(payload, 0xAA);
         let next = reader.read_u8().expect("next byte");
         assert_eq!(next, 0xBB);
+    }
+
+    #[test]
+    fn truncated_section_padding_is_rejected() {
+        let mut reader =
+            PsdReader::new(Cursor::new(vec![0, 0, 0, 1, 0xAA]), ReadOptions::default());
+        let result = reader.read_section(2, false, |reader, _| reader.read_u8());
+        assert!(result.is_err(), "missing alignment padding must fail");
+    }
+
+    #[test]
+    fn test_section_handler_overread_is_rejected() {
+        // One-byte section whose handler reads a u16 must error instead of
+        // silently consuming the following byte.
+        let data = vec![
+            0x00, 0x00, 0x00, 0x01, // section length = 1
+            0x07, // payload byte
+            0x08, // sibling byte that must not be consumed
+        ];
+        let mut reader = PsdReader::new(Cursor::new(data), ReadOptions::default());
+        let err = reader
+            .read_section(1, false, |r, _| r.read_u16())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("overread"),
+            "unexpected error: {}",
+            err
+        );
+        // The failed read consumed nothing: the payload byte is still there.
+        assert_eq!(reader.read_u8().unwrap(), 0x07);
+    }
+
+    #[test]
+    fn test_section_declared_payload_past_eof_is_rejected() {
+        // Declared 100-byte payload with no payload bytes present must error
+        // even when the callback reads nothing.
+        let data = vec![
+            0x00, 0x00, 0x00, 0x64, // section length = 100
+        ];
+        let mut reader = PsdReader::new(Cursor::new(data), ReadOptions::default());
+        let err = reader.read_section(1, false, |_, _| Ok(())).unwrap_err();
+        assert!(
+            err.to_string().contains("exceeds available input"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_nested_section_bounds_apply_to_inner_handlers() {
+        // Outer section length 6; inner section claims 4 but only 2 bytes are
+        // left within the outer payload. The inner declared payload is valid
+        // against the physical input, so reading it must fail inside the
+        // bounded read instead of consuming outer-payload siblings.
+        let data = vec![
+            0x00, 0x00, 0x00, 0x06, // outer length = 6
+            0x00, 0x00, 0x00, 0x05, // inner length = 5 (exceeds outer payload)
+            0x01, 0x02, // only two payload bytes follow
+        ];
+        let mut reader = PsdReader::new(Cursor::new(data), ReadOptions::default());
+        let err = reader
+            .read_section(1, false, |reader, end_offset| {
+                if reader.bytes_left(end_offset) > 0 {
+                    reader.read_section(1, false, |r, _| r.read_u8())?;
+                }
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("overread")
+                || err.to_string().contains("exceeds available input"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -1785,13 +2176,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_layer_hierarchy_uses_bounding_as_group_layer() {
+    fn test_build_layer_hierarchy_keeps_folder_marker_as_group() {
         let mut psd = Psd::default();
-        let group = Layer {
+        let marker = Layer {
+            opacity: Some(0.25),
+            hidden: Some(true),
             additional_info: crate::format::additional_info::LayerAdditionalInfo {
                 name: Some("Group".to_string()),
                 section_divider: Some(crate::format::additional_info::SectionDivider {
-                    divider_type: SectionDividerType::BoundingSectionDivider,
+                    divider_type: SectionDividerType::ClosedFolder,
                     blend_mode: None,
                     sub_type: None,
                 }),
@@ -1806,10 +2199,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let close = Layer {
+        let bounding = Layer {
             additional_info: crate::format::additional_info::LayerAdditionalInfo {
                 section_divider: Some(crate::format::additional_info::SectionDivider {
-                    divider_type: SectionDividerType::ClosedFolder,
+                    divider_type: SectionDividerType::BoundingSectionDivider,
                     blend_mode: None,
                     sub_type: None,
                 }),
@@ -1818,11 +2211,14 @@ mod tests {
             ..Default::default()
         };
 
-        build_layer_hierarchy(&mut psd, vec![group, leaf, close]).expect("build hierarchy");
+        build_layer_hierarchy(&mut psd, vec![bounding, leaf, marker]).expect("build hierarchy");
 
         let roots = psd.children.expect("root layers");
         assert_eq!(roots.len(), 1);
+        // The folder marker's own properties survive as the public group.
         assert_eq!(roots[0].additional_info.name.as_deref(), Some("Group"));
+        assert_eq!(roots[0].opacity, Some(0.25));
+        assert_eq!(roots[0].hidden, Some(true));
         assert_eq!(roots[0].opened, Some(false));
         assert_eq!(
             roots[0]
@@ -1836,11 +2232,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_layer_hierarchy_uses_close_marker_name_for_generic_bounding_name() {
+    fn test_build_layer_hierarchy_preserves_empty_group() {
         let mut psd = Psd::default();
-        let group = Layer {
+        let marker = Layer {
             additional_info: crate::format::additional_info::LayerAdditionalInfo {
-                name: Some("</Layer group>".to_string()),
+                name: Some("Empty".to_string()),
+                section_divider: Some(crate::format::additional_info::SectionDivider {
+                    divider_type: SectionDividerType::OpenFolder,
+                    blend_mode: None,
+                    sub_type: None,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let bounding = Layer {
+            additional_info: crate::format::additional_info::LayerAdditionalInfo {
                 section_divider: Some(crate::format::additional_info::SectionDivider {
                     divider_type: SectionDividerType::BoundingSectionDivider,
                     blend_mode: None,
@@ -1850,18 +2257,24 @@ mod tests {
             },
             ..Default::default()
         };
-        let leaf = Layer {
+
+        build_layer_hierarchy(&mut psd, vec![bounding, marker]).expect("build hierarchy");
+
+        let roots = psd.children.expect("root layers");
+        assert_eq!(roots.len(), 1);
+        // Empty groups stay groups (Some(vec![])), so writes recognize them.
+        assert_eq!(roots[0].children.as_ref(), Some(&Vec::new()));
+        assert_eq!(roots[0].opened, Some(true));
+    }
+
+    #[test]
+    fn test_build_layer_hierarchy_rejects_unbalanced_markers() {
+        let mut psd = Psd::default();
+        let marker = Layer {
             additional_info: crate::format::additional_info::LayerAdditionalInfo {
-                name: Some("Leaf".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let close = Layer {
-            additional_info: crate::format::additional_info::LayerAdditionalInfo {
-                name: Some("top".to_string()),
+                name: Some("Unclosed".to_string()),
                 section_divider: Some(crate::format::additional_info::SectionDivider {
-                    divider_type: SectionDividerType::ClosedFolder,
+                    divider_type: SectionDividerType::OpenFolder,
                     blend_mode: None,
                     sub_type: None,
                 }),
@@ -1869,27 +2282,90 @@ mod tests {
             },
             ..Default::default()
         };
-
-        build_layer_hierarchy(&mut psd, vec![group, leaf, close]).expect("build hierarchy");
-
-        let roots = psd.children.expect("root layers");
-        assert_eq!(roots.len(), 1);
-        assert_eq!(roots[0].additional_info.name.as_deref(), Some("top"));
-        assert_eq!(
-            roots[0]
-                .children
-                .as_ref()
-                .expect("group children")
-                .first()
-                .and_then(|child| child.additional_info.name.as_deref()),
-            Some("Leaf")
+        let err = build_layer_hierarchy(&mut psd, vec![marker]).unwrap_err();
+        assert!(
+            err.to_string().contains("never closed"),
+            "unexpected error: {}",
+            err
         );
     }
 
     #[test]
-    fn test_layer_user_mask_modulates_alpha_and_is_preserved() {
+    fn strict_mode_rejects_short_raw_channel() {
+        // One 1x1 color channel, compression = raw (0), zero payload bytes.
         let mut bytes = Vec::new();
-        for data in [&[10u8, 20][..], &[0u8, 0][..], &[0u8, 0][..], &[255u8, 255][..]] {
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // compression: raw
+                                                      // No payload: the channel claims one pixel but carries no bytes.
+
+        let mut lenient_reader = PsdReader::new(Cursor::new(bytes.clone()), ReadOptions::default());
+        let lenient_psd = Psd {
+            color_mode: Some(ColorMode::RGB),
+            bits_per_channel: Some(8),
+            ..Default::default()
+        };
+        let mut lenient_layer = Layer {
+            left: Some(0),
+            top: Some(0),
+            right: Some(1),
+            bottom: Some(1),
+            ..Default::default()
+        };
+        read_layer_channel_image_data(
+            &mut lenient_reader,
+            &lenient_psd,
+            &mut lenient_layer,
+            &[ChannelInfo {
+                id: ChannelID::Color0,
+                length: 2,
+            }],
+        )
+        .expect("lenient read pads the missing byte");
+
+        let mut strict_reader = PsdReader::new(
+            Cursor::new(bytes),
+            ReadOptions {
+                strict: Some(true),
+                ..Default::default()
+            },
+        );
+        let strict_psd = Psd {
+            color_mode: Some(ColorMode::RGB),
+            bits_per_channel: Some(8),
+            ..Default::default()
+        };
+        let mut strict_layer = Layer {
+            left: Some(0),
+            top: Some(0),
+            right: Some(1),
+            bottom: Some(1),
+            ..Default::default()
+        };
+        let err = read_layer_channel_image_data(
+            &mut strict_reader,
+            &strict_psd,
+            &mut strict_layer,
+            &[ChannelInfo {
+                id: ChannelID::Color0,
+                length: 2,
+            }],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Strict parse"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_layer_user_mask_preserved_independently_of_alpha() {
+        let mut bytes = Vec::new();
+        for data in [
+            &[10u8, 20][..],
+            &[0u8, 0][..],
+            &[0u8, 0][..],
+            &[255u8, 255][..],
+        ] {
             bytes.extend_from_slice(&0u16.to_be_bytes());
             bytes.extend_from_slice(data);
         }
@@ -1942,10 +2418,12 @@ mod tests {
             },
         ];
 
-        read_layer_channel_image_data(&mut reader, &psd, &mut layer, &channels).expect("read channels");
+        read_layer_channel_image_data(&mut reader, &psd, &mut layer, &channels)
+            .expect("read channels");
 
         let pixels = layer.image_data.expect("layer image").data;
-        assert_eq!(pixels, vec![10, 0, 0, 255, 20, 0, 0, 0]);
+        // Underlying alpha survives unmasked; the mask is stored separately.
+        assert_eq!(pixels, vec![10, 0, 0, 255, 20, 0, 0, 255]);
 
         let mask = layer
             .additional_info
@@ -2026,10 +2504,12 @@ mod tests {
             },
         ];
 
-        read_layer_channel_image_data(&mut reader, &psd, &mut layer, &channels).expect("read channels");
+        read_layer_channel_image_data(&mut reader, &psd, &mut layer, &channels)
+            .expect("read channels");
 
         let pixels = layer.image_data.expect("layer image").data;
-        assert_eq!(pixels, vec![10, 0, 0, 100, 20, 0, 0, 255]);
+        // Neither mask modulates preview alpha during parsing.
+        assert_eq!(pixels, vec![10, 0, 0, 255, 20, 0, 0, 255]);
 
         let user_mask = layer
             .additional_info

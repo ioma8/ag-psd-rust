@@ -31,7 +31,8 @@ fn main() -> Result<()> {
 
     if let Some(ref mut layers) = psd.children {
         for layer in layers {
-            layer.opacity = Some(128.0);
+            // Opacity is 0..1; Photoshop's 0..255 byte value is scaled.
+            layer.opacity = Some(128.0 / 255.0);
         }
     }
 
@@ -57,8 +58,8 @@ fn main() -> Result<()> {
 | PSD/PSB structure | Broad support | Reader and writer cover the main parser/writer surface |
 | Layers, masks, effects | Broad support | Includes vector masks, many tagged blocks, and effect structures |
 | Text layers | Partial | Rich text structures are supported, but not every Photoshop text workflow is exhaustively validated |
-| Color modes | Partial | Reads RGB/Grayscale/CMYK/Indexed/Bitmap composites; CMYK/Grayscale layer pixels are preserved via raw data only, and synthesizing new non-RGB layers from RGBA image data returns an error |
-| 16/32-bit depth | Partial | Structural support exists, but not every path is fully validated end to end |
+| Color modes | Partial | Reads RGB/Grayscale/CMYK/Indexed composites (Indexed via palette lookup). Bitmap composite decoding is read-only and not yet implemented; composite writing from an RGBA preview is supported for RGB and Grayscale only, and rejected for CMYK/Indexed/Bitmap rather than emitting mismatched channels. Synthesizing new non-RGB layers from RGBA image data returns an error |
+| 16/32-bit depth | Partial | Structural support exists, but high-bit-depth layer and composite pixel roundtrips are not yet fully validated end to end |
 | Smart objects / linked data | Partial | Typed structures exist, but not every Photoshop workflow is exhaustively covered |
 
 ## Limits

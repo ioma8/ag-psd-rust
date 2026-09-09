@@ -16,9 +16,9 @@
 
 pub mod api;
 pub mod format;
+pub mod formats;
 pub mod io;
 pub mod support;
-pub mod formats;
 
 pub use api::{adjustments, effects, layer, psd, text, types};
 pub use format::{additional_info, document_resource_postprocess, image_resources};
@@ -45,7 +45,9 @@ pub use layer::{
     BezierKnot, BezierPath, Layer, LayerMaskData, LayerVectorMask, LinkedFile, PatternInfo,
     VectorContent,
 };
-pub use psd::{Annotation, DocumentSlices, GlobalLayerMaskInfo, GuideInfo, Psd, ReadOptions, WriteOptions};
+pub use psd::{
+    Annotation, DocumentSlices, GlobalLayerMaskInfo, GuideInfo, Psd, ReadOptions, WriteOptions,
+};
 pub use psd::{ColorSampler, ColorSamplerPosition, DisplayInfo};
 pub use reader::{read_psd, PsdReader};
 pub use text::{

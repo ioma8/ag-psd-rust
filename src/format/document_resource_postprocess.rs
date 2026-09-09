@@ -4,13 +4,62 @@
 //! color_samplers) to/from the low-level image resource storage (XML strings, typed resources,
 //! descriptor resources).
 
-use crate::support::error::{PsdError, Result};
+use crate::api::layer::Layer;
 use crate::api::psd::Psd;
+use crate::support::error::{PsdError, Result};
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::XmlVersion;
 use quick_xml::{Reader, Writer};
 use std::io::Cursor;
+
+/// Collect the canonical flat-layer slot paths of a tree in flatten_layers
+/// order: a plain layer contributes one slot; a group contributes its two
+/// section-divider marker slots (bounding first, folder last) surrounding the
+/// slots of its descendants. Resource 1072 carries one value per slot.
+fn collect_visibility_slots(children: &[Layer], out: &mut Vec<Vec<usize>>) {
+    fn walk(children: &[Layer], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+        for (index, child) in children.iter().enumerate() {
+            prefix.push(index);
+            if let Some(ref grand_children) = child.children {
+                out.push(prefix.clone()); // bounding section-divider marker
+                walk(grand_children, prefix, out);
+                out.push(prefix.clone()); // folder marker
+            } else {
+                out.push(prefix.clone());
+            }
+            prefix.pop();
+        }
+    }
+    let mut prefix = Vec::new();
+    walk(children, &mut prefix, out);
+}
+
+fn layer_at_mut<'a>(children: &'a mut [Layer], path: &[usize]) -> Option<&'a mut Layer> {
+    let index = *path.first()?;
+    let child = children.get_mut(index)?;
+    if path.len() == 1 {
+        Some(child)
+    } else {
+        layer_at_mut(child.children.as_deref_mut()?, &path[1..])
+    }
+}
+
+fn layer_at<'a>(children: &'a [Layer], path: &[usize]) -> Option<&'a Layer> {
+    let index = *path.first()?;
+    let child = children.get(index)?;
+    if path.len() == 1 {
+        Some(child)
+    } else {
+        layer_at(child.children.as_ref()?, &path[1..])
+    }
+}
+
+fn slot_visibility_value(children: &[Layer], slot: &[usize]) -> bool {
+    layer_at(children, slot)
+        .map(|l| l.resource_visible != Some(false))
+        .unwrap_or(true)
+}
 
 /// Apply read-side document resource postprocess: map low-level ImageResources fields
 /// onto typed Psd fields.
@@ -20,13 +69,20 @@ pub fn apply_document_postprocess(psd: &mut Psd) -> Result<()> {
             psd.layer_group_ids = Some(group_ids.clone());
         }
 
-        // Map resource visibility from resource 1072
+        // Map resource visibility from resource 1072. Entries correspond to
+        // the canonical flat layer order (the same sequence produced by
+        // flatten_layers), where a group occupies two section-divider marker
+        // slots (bounding and folder) around its descendants.
         if let (Some(visibility), Some(layers)) = (
             resources.resource_visibility_typed.as_ref(),
             psd.children.as_mut(),
         ) {
-            for (layer, value) in layers.iter_mut().zip(visibility.values.iter()) {
-                layer.resource_visible = Some(*value);
+            let mut slots = Vec::new();
+            collect_visibility_slots(layers, &mut slots);
+            for (slot, value) in slots.iter().zip(visibility.values.iter()) {
+                if let Some(node) = layer_at_mut(layers, slot) {
+                    node.resource_visible = Some(*value);
+                }
             }
         }
 
@@ -79,14 +135,16 @@ pub fn apply_document_postprocess(psd: &mut Psd) -> Result<()> {
                 let guides: Vec<crate::api::psd::GuideInfo> = grid_info
                     .guides
                     .iter()
-                    .map(|g| {
-                        crate::api::psd::GuideInfo {
-                            location: g.location,
-                            direction: match g.direction {
-                                crate::format::image_resources::GuideDirection::Vertical => crate::api::types::GuideDirection::Vertical,
-                                crate::format::image_resources::GuideDirection::Horizontal => crate::api::types::GuideDirection::Horizontal,
-                            },
-                        }
+                    .map(|g| crate::api::psd::GuideInfo {
+                        location: g.location,
+                        direction: match g.direction {
+                            crate::format::image_resources::GuideDirection::Vertical => {
+                                crate::api::types::GuideDirection::Vertical
+                            }
+                            crate::format::image_resources::GuideDirection::Horizontal => {
+                                crate::api::types::GuideDirection::Horizontal
+                            }
+                        },
                     })
                     .collect();
                 psd.guides = Some(guides);
@@ -138,13 +196,24 @@ pub fn apply_document_prewrite(psd: &mut Psd) -> Result<()> {
         resources.layer_group_ids = Some(group_ids.clone());
     }
 
-    // Map resource visibility from layers → resource 1072
+    // Map resource visibility from layers → resource 1072, aligned with the
+    // canonical flat layer order (flatten_layers): one entry per layer record
+    // including the two section-divider marker slots each group occupies. The
+    // resource is always rebuilt after an edit - even when every value became
+    // true again - so a stale original payload cannot survive a change.
     if let Some(layers) = psd.children.as_ref() {
-        let values: Vec<bool> = layers
+        let mut slots = Vec::new();
+        collect_visibility_slots(layers, &mut slots);
+        let values: Vec<bool> = slots
             .iter()
-            .map(|layer| layer.resource_visible != Some(false))
+            .map(|slot| slot_visibility_value(layers, slot))
             .collect();
-        if values.iter().any(|value| !*value) {
+        let existed = resources.resource_visibility_typed.is_some()
+            || resources
+                .original_blocks
+                .iter()
+                .any(|raw| raw.resource_id == 1072);
+        if existed || values.iter().any(|value| !*value) {
             resources.resource_visibility_typed =
                 Some(crate::format::image_resources::ResourceVisibility { values });
         }
@@ -172,37 +241,55 @@ pub fn apply_document_prewrite(psd: &mut Psd) -> Result<()> {
     }
 
     if let Some(points) = psd.color_samplers.as_ref() {
-        let version = crate::format::image_resources::infer_color_sampler_version(points)?.unwrap_or(2);
-        resources.color_samplers_typed = Some(crate::format::image_resources::ColorSamplersResource {
-            version,
-            samplers: points.clone(),
-        });
+        let version =
+            crate::format::image_resources::infer_color_sampler_version(points)?.unwrap_or(2);
+        resources.color_samplers_typed =
+            Some(crate::format::image_resources::ColorSamplersResource {
+                version,
+                samplers: points.clone(),
+            });
     }
 
-    if let Some(info) = psd.display_info.as_ref() {
-        resources.display_info_typed = Some(crate::format::image_resources::DisplayInfoResource {
-            version: 1,
-            h_res_unit: info.h_res_unit,
-            v_res_unit: info.v_res_unit,
-            width_unit: info.width_unit,
-            height_unit: info.height_unit,
-        });
+    // Map typed display info → resource 1077. When the resource was loaded
+    // and its raw payload is retained, keep that payload byte-for-byte; the
+    // typed mirror is only written for newly constructed resources.
+    if resources.display_info_raw.is_none() {
+        if let Some(info) = psd.display_info.as_ref() {
+            resources.display_info_typed =
+                Some(crate::format::image_resources::DisplayInfoResource {
+                    version: 1,
+                    h_res_unit: info.h_res_unit,
+                    v_res_unit: info.v_res_unit,
+                    width_unit: info.width_unit,
+                    height_unit: info.height_unit,
+                });
+        }
     }
 
     if let Some(name) = psd.clipping_path_name.as_ref() {
         resources.clipping_path_name = Some(name.clone());
     }
 
-    // Map resolution → resource 1005
+    // Map resolution → resource 1005. The full resource (units, unequal
+    // axes) is preserved when unedited: the mirror is only rewritten when the
+    // typed resolution differs from the stored horizontal resolution, i.e.
+    // when the caller explicitly changed it.
     if let Some(dpi) = psd.resolution {
-        resources.resolution_info = Some(crate::format::image_resources::ResolutionInfo {
-            horizontal_res: dpi,
-            horizontal_res_unit: crate::format::image_resources::ResolutionUnit::PixelsPerInch,
-            width_unit: crate::format::image_resources::MeasurementUnit::Inches,
-            vertical_res: dpi,
-            vertical_res_unit: crate::format::image_resources::ResolutionUnit::PixelsPerInch,
-            height_unit: crate::format::image_resources::MeasurementUnit::Inches,
-        });
+        let unchanged = resources
+            .resolution_info
+            .as_ref()
+            .map(|info| info.horizontal_res == dpi)
+            .unwrap_or(false);
+        if !unchanged {
+            resources.resolution_info = Some(crate::format::image_resources::ResolutionInfo {
+                horizontal_res: dpi,
+                horizontal_res_unit: crate::format::image_resources::ResolutionUnit::PixelsPerInch,
+                width_unit: crate::format::image_resources::MeasurementUnit::Inches,
+                vertical_res: dpi,
+                vertical_res_unit: crate::format::image_resources::ResolutionUnit::PixelsPerInch,
+                height_unit: crate::format::image_resources::MeasurementUnit::Inches,
+            });
+        }
     }
 
     // Map guides → resource 1032
@@ -226,12 +313,12 @@ pub fn apply_document_prewrite(psd: &mut Psd) -> Result<()> {
                     crate::api::types::GuideDirection::Horizontal => {
                         Ok(crate::format::image_resources::GuideDirection::Horizontal)
                     }
-                    crate::api::types::GuideDirection::Other(code) => Err(PsdError::InvalidFormat(
-                        format!(
+                    crate::api::types::GuideDirection::Other(code) => {
+                        Err(PsdError::InvalidFormat(format!(
                             "Guide direction code {:?} cannot be serialized to resource 1032",
                             std::str::from_utf8(&code).unwrap_or("????")
-                        ),
-                    )),
+                        )))
+                    }
                 }?;
                 Ok(crate::format::image_resources::Guide {
                     location: g.location,
@@ -528,5 +615,103 @@ mod tests {
                 vec!["A&B".to_string(), "<ok>".to_string()],
             ]
         );
+    }
+
+    fn layer_named(name: &str) -> Layer {
+        let mut layer = Layer::default();
+        layer.additional_info.name = Some(name.to_string());
+        layer
+    }
+
+    #[test]
+    fn visibility_slot_count_matches_flatten_layers() {
+        let mut group = layer_named("group");
+        group.children = Some(vec![layer_named("inner"), layer_named("deeper")]);
+        let mut psd = Psd::default();
+        psd.children = Some(vec![group, layer_named("tail")]);
+
+        let mut slots = Vec::new();
+        collect_visibility_slots(psd.children.as_ref().unwrap(), &mut slots);
+        let flat = crate::io::writer::flatten_layers(psd.children.as_ref());
+        assert_eq!(slots.len(), flat.len());
+        assert_eq!(slots.len(), 5); // group bounding + inner + deeper + group folder + tail
+    }
+
+    #[test]
+    fn nested_visibility_read_maps_marker_aware_flat_order() {
+        let mut group = layer_named("group");
+        group.children = Some(vec![layer_named("inner")]);
+        let mut psd = Psd::default();
+        psd.children = Some(vec![group, layer_named("tail")]);
+        // Slots: [group(bounding), inner, group(folder), tail]
+        let mut resources = crate::format::image_resources::ImageResources::default();
+        resources.resource_visibility_typed =
+            Some(crate::format::image_resources::ResourceVisibility {
+                values: vec![true, false, true, true],
+            });
+        psd.image_resources = Some(resources);
+
+        crate::format::document_resource_postprocess::apply_document_postprocess(&mut psd).unwrap();
+
+        let children = psd.children.as_ref().unwrap();
+        assert_eq!(children[0].resource_visible, Some(true));
+        assert_eq!(
+            children[0].children.as_ref().unwrap()[0].resource_visible,
+            Some(false)
+        );
+        assert_eq!(children[1].resource_visible, Some(true));
+    }
+
+    #[test]
+    fn nested_visibility_write_keeps_flat_order_after_edit() {
+        let mut group = layer_named("group");
+        group.children = Some(vec![layer_named("inner")]);
+        group.resource_visible = Some(true);
+        let mut psd = Psd::default();
+        psd.children = Some(vec![group, layer_named("tail")]);
+
+        // Resource existed with a disabled descendant; flip that value to true
+        // and confirm the resource is rebuilt (not left stale).
+        let mut resources = crate::format::image_resources::ImageResources::default();
+        resources.resource_visibility_typed =
+            Some(crate::format::image_resources::ResourceVisibility {
+                values: vec![true, false, true, true],
+            });
+        psd.image_resources = Some(resources);
+
+        psd.children.as_mut().unwrap()[0].children.as_mut().unwrap()[0].resource_visible =
+            Some(true);
+
+        crate::format::document_resource_postprocess::apply_document_prewrite(&mut psd).unwrap();
+
+        let rebuilt = psd
+            .image_resources
+            .as_ref()
+            .unwrap()
+            .resource_visibility_typed
+            .as_ref()
+            .expect("1072 must be rebuilt after the edit");
+        assert_eq!(rebuilt.values, vec![true, true, true, true]);
+    }
+
+    #[test]
+    fn visibility_write_uses_nested_slot_values() {
+        let mut group = layer_named("group");
+        group.resource_visible = Some(false);
+        group.children = Some(vec![layer_named("inner")]);
+        let mut psd = Psd::default();
+        psd.children = Some(vec![group, layer_named("tail")]);
+
+        crate::format::document_resource_postprocess::apply_document_prewrite(&mut psd).unwrap();
+
+        let rebuilt = psd
+            .image_resources
+            .as_ref()
+            .unwrap()
+            .resource_visibility_typed
+            .as_ref()
+            .expect("a disabled group must be recorded");
+        // [group(bounding)=false, inner=true, group(folder)=false, tail=true]
+        assert_eq!(rebuilt.values, vec![false, true, false, true]);
     }
 }

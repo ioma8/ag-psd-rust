@@ -3,6 +3,14 @@
 //! Image resources contain document-level information like resolution,
 //! guides, grids, color profiles, and thumbnails.
 
+#[cfg(test)]
+use crate::api::psd::ReadOptions;
+use crate::api::types::{
+    BlendMode, Color, DisplayUnit, Fraction, LayerCompCapturedInfo, Point, RenderingIntent,
+    SliceAlignment, SliceOrigin, SliceSourceType, SliceType,
+};
+use crate::io::reader::PsdReader;
+use crate::io::writer::PsdWriter;
 use crate::support::binrw_support::{
     decode_be, encode_be, DisplayInfoRecord, GridAndGuidesHeaderRecord, GuideRecord,
     ImageResourceHeaderRecord, ImageResourceLengthRecord, LayerStateRecord, PrintFlagsRecord,
@@ -11,12 +19,6 @@ use crate::support::binrw_support::{
 };
 use crate::support::descriptor::Descriptor;
 use crate::support::error::{PsdError, Result};
-use crate::io::reader::PsdReader;
-use crate::api::types::{
-    BlendMode, Color, DisplayUnit, Fraction, LayerCompCapturedInfo, Point, RenderingIntent,
-    SliceAlignment, SliceOrigin, SliceSourceType, SliceType,
-};
-use crate::io::writer::PsdWriter;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Seek};
 
@@ -43,6 +45,11 @@ pub struct ImageResources {
     pub url: Option<String>,
     /// Thumbnail
     pub thumbnail: Option<Thumbnail>,
+    /// Original thumbnail payload, retained when thumbnail decoding is skipped
+    /// or when raw-thumbnail mode is requested.
+    pub thumbnail_raw: Option<Vec<u8>>,
+    /// True when the thumbnail was intentionally not decoded by ReadOptions.
+    pub thumbnail_skipped: bool,
     /// Grid and guides
     pub grid_and_guides: Option<GridAndGuides>,
     /// Global lighting angle
@@ -59,6 +66,9 @@ pub struct ImageResources {
     pub color_samplers_typed: Option<ColorSamplersResource>,
     /// Display info (resource 1077)
     pub display_info_typed: Option<DisplayInfoResource>,
+    /// Original bytes of resource 1077, retained so an unedited save never
+    /// drops or regenerates payloads the typed model cannot represent.
+    pub display_info_raw: Option<Vec<u8>>,
     /// Name of clipping path (resource 2999)
     pub clipping_path_name: Option<String>,
     /// Layer selection IDs
@@ -97,6 +107,11 @@ pub struct ImageResources {
     pub descriptor_resources: HashMap<u16, Descriptor>,
     /// Opaque resource blocks preserved verbatim for unknown/unmodeled resources.
     pub raw_resources: Vec<RawImageResource>,
+    /// Complete original envelopes of modeled resources as read from a file,
+    /// one entry per occurrence. Unmodified payloads are re-emitted verbatim
+    /// (preserving names, duplicates, order and trailing bytes); a semantic
+    /// edit to the typed value replaces the envelope instead.
+    pub original_blocks: Vec<RawImageResource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1223,6 +1238,102 @@ impl PsdWriter {
     }
 }
 
+/// Reassemble a full on-the-wire image-resource block from its parts,
+/// reproducing the exact original bytes (signature, id, name, even padding,
+/// length, payload, even padding).
+fn assemble_resource_block(
+    signature: &[u8; 4],
+    resource_id: u16,
+    name_length: u8,
+    name: &[u8],
+    data_length: usize,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(7 + name_length as usize + 4 + data_length + 2);
+    raw.extend_from_slice(signature);
+    raw.extend_from_slice(&resource_id.to_be_bytes());
+    raw.push(name_length);
+    raw.extend_from_slice(name);
+    if (name_length as usize + 1) % 2 != 0 {
+        raw.push(0);
+    }
+    raw.extend_from_slice(&(data_length as u32).to_be_bytes());
+    raw.extend_from_slice(data);
+    if data_length % 2 != 0 {
+        raw.push(0);
+    }
+    raw
+}
+
+/// Payload bytes of a block produced by `build_resource` (canonical header
+/// with an empty name: 7 header bytes + 1 name pad + 4 length bytes).
+fn typed_block_payload(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 12 {
+        return None;
+    }
+    let len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    bytes.get(12..12 + len)
+}
+
+/// Payload bytes of an arbitrary wire block, located by parsing its name
+/// length and data length fields.
+fn raw_block_payload(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let name_length = bytes[6] as usize;
+    let name_pad = (name_length + 1) % 2;
+    let len_start = 7 + name_length + name_pad;
+    let end = len_start + 4;
+    if bytes.len() < end {
+        return None;
+    }
+    let len = u32::from_be_bytes([
+        bytes[len_start],
+        bytes[len_start + 1],
+        bytes[len_start + 2],
+        bytes[len_start + 3],
+    ]) as usize;
+    bytes.get(end..end + len)
+}
+
+/// Whether a resource id is modeled somewhere in this module's typed fields.
+fn is_modeled_resource(resource_id: u16) -> bool {
+    matches!(
+        resource_id,
+        1005 | 1006
+            | 1010
+            | 1011
+            | 1024
+            | 1026
+            | 1032
+            | 1034
+            | 1035
+            | 1036
+            | 1037
+            | 1039
+            | 1045
+            | 1049
+            | 1050
+            | 1053
+            | 1060
+            | 1061
+            | 1062
+            | 1065
+            | 1069
+            | 1072
+            | 1073
+            | 1074
+            | 1075
+            | 1077
+            | 2999
+            | 3000
+            | 7000
+            | 7001
+            | 2000..=2998
+    )
+}
+
 /// Process all image resources from reader
 pub fn read_image_resources<R: Read + Seek>(
     reader: &mut PsdReader<R>,
@@ -1267,11 +1378,29 @@ pub fn read_image_resources<R: Read + Seek>(
             1032 => reader.read_grid_and_guides(&mut resources)?,
             1036 => {
                 let bytes = reader.read_bytes(data_length)?;
-                resources.thumbnail = parse_thumbnail_resource(&bytes);
+                resources.thumbnail_raw = Some(bytes.clone());
+                resources.thumbnail_skipped = reader.options.skip_thumbnail.unwrap_or(false);
+                if !reader.options.skip_thumbnail.unwrap_or(false)
+                    && !reader.options.use_raw_thumbnail.unwrap_or(false)
+                {
+                    resources.thumbnail = parse_thumbnail_resource(&bytes);
+                    if resources.thumbnail.is_none() && reader.options.strict.unwrap_or(false) {
+                        return Err(PsdError::InvalidFormat(
+                            "Malformed thumbnail resource payload".to_string(),
+                        ));
+                    }
+                }
             }
             1077 => {
                 let bytes = reader.read_bytes(data_length)?;
+                resources.display_info_raw = Some(bytes.clone());
                 resources.display_info_typed = parse_display_info_resource(&bytes);
+                if resources.display_info_typed.is_none() && reader.options.strict.unwrap_or(false)
+                {
+                    return Err(PsdError::InvalidFormat(
+                        "Malformed display-info resource payload".to_string(),
+                    ));
+                }
             }
             1034 => reader.read_copyright_flag(&mut resources)?,
             1035 => reader.read_url(&mut resources, data_length)?,
@@ -1321,22 +1450,16 @@ pub fn read_image_resources<R: Read + Seek>(
             }
             _ => {
                 let data = reader.read_bytes(data_length)?;
-                let mut raw = Vec::new();
-                raw.extend_from_slice(&header.signature);
-                raw.extend_from_slice(&resource_id.to_be_bytes());
-                raw.push(header.name_length);
-                raw.extend_from_slice(&name);
-                if (name_length + 1) % 2 != 0 {
-                    raw.push(0);
-                }
-                raw.extend_from_slice(&(data_length as u32).to_be_bytes());
-                raw.extend_from_slice(&data);
-                if data_length % 2 != 0 {
-                    raw.push(0);
-                }
                 resources.raw_resources.push(RawImageResource {
                     resource_id,
-                    bytes: raw,
+                    bytes: assemble_resource_block(
+                        &header.signature,
+                        resource_id,
+                        header.name_length,
+                        &name,
+                        data_length,
+                        &data,
+                    ),
                 });
             }
         }
@@ -1344,6 +1467,37 @@ pub fn read_image_resources<R: Read + Seek>(
         reader.seek_to(resource_start + data_length as u64)?;
         if data_length % 2 != 0 {
             reader.skip_bytes(1)?;
+        }
+
+        // Modeled resources keep their complete original envelope (name,
+        // signature, version words, multiplicity, residual/trailing bytes) in
+        // original_blocks. An unmodified save re-emits these blocks verbatim
+        // instead of regenerating them from typed fields, so payloads this
+        // module cannot model never silently disappear or get reinterpreted.
+        // A semantic edit to the typed value replaces the envelope instead.
+        if is_modeled_resource(resource_id) {
+            let section_remaining = length as u64 - (resource_start - start_offset);
+            if data_length as u64 > section_remaining {
+                return Err(PsdError::InvalidFormat(format!(
+                    "Image resource {} declares {} bytes beyond its section",
+                    resource_id, data_length
+                )));
+            }
+            let end = reader.offset;
+            reader.seek_to(resource_start)?;
+            let data = reader.read_bytes(data_length)?;
+            reader.seek_to(end)?;
+            resources.original_blocks.push(RawImageResource {
+                resource_id,
+                bytes: assemble_resource_block(
+                    &header.signature,
+                    resource_id,
+                    header.name_length,
+                    &name,
+                    data_length,
+                    &data,
+                ),
+            });
         }
     }
 
@@ -1355,48 +1509,55 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     use std::collections::{HashMap, HashSet, VecDeque};
 
     // Helper to write a resource block
-    let build_resource = |id: u16, write_fn: &dyn Fn(&mut PsdWriter) -> Result<()>| -> Result<Vec<u8>> {
-        let mut resource = PsdWriter::new(1024);
-        resource.write_bytes(&encode_be(
-            &ImageResourceHeaderRecord {
-                signature: *b"8BIM",
-                resource_id: id,
-                name_length: 0,
-            },
-            "image resource header",
-        )?)?;
-        resource.write_u8(0)?; // Name padding
+    let build_resource =
+        |id: u16, write_fn: &dyn Fn(&mut PsdWriter) -> Result<()>| -> Result<Vec<u8>> {
+            let mut resource = PsdWriter::new(1024);
+            resource.write_bytes(&encode_be(
+                &ImageResourceHeaderRecord {
+                    signature: *b"8BIM",
+                    resource_id: id,
+                    name_length: 0,
+                },
+                "image resource header",
+            )?)?;
+            resource.write_u8(0)?; // Name padding
 
-        // Write to temp buffer to get length
-        let mut temp_writer = PsdWriter::new(1024);
-        write_fn(&mut temp_writer)?;
-        let data = temp_writer.get_buffer();
+            // Write to temp buffer to get length
+            let mut temp_writer = PsdWriter::new(1024);
+            write_fn(&mut temp_writer)?;
+            let data = temp_writer.get_buffer();
 
-        resource.write_bytes(&encode_be(
-            &ImageResourceLengthRecord {
-                data_length: data.len() as u32,
-            },
-            "image resource length",
-        )?)?;
-        resource.write_bytes(data)?;
+            resource.write_bytes(&encode_be(
+                &ImageResourceLengthRecord {
+                    data_length: data.len() as u32,
+                },
+                "image resource length",
+            )?)?;
+            resource.write_bytes(data)?;
 
-        // Pad to even boundary
-        if data.len() % 2 != 0 {
-            resource.write_u8(0)?;
-        }
+            // Pad to even boundary
+            if data.len() % 2 != 0 {
+                resource.write_u8(0)?;
+            }
 
-        Ok(resource.into_buffer())
-    };
+            Ok(resource.into_buffer())
+        };
 
     let mut typed_resources = Vec::new();
 
     // Write each resource type
     if let Some(ref info) = resources.resolution_info {
-        typed_resources.push((1005, build_resource(1005, &|w| w.write_resolution_info(info))?));
+        typed_resources.push((
+            1005,
+            build_resource(1005, &|w| w.write_resolution_info(info))?,
+        ));
     }
 
     if let Some(ref color) = resources.background_color {
-        typed_resources.push((1010, build_resource(1010, &|w| w.write_background_color(color))?));
+        typed_resources.push((
+            1010,
+            build_resource(1010, &|w| w.write_background_color(color))?,
+        ));
     }
 
     if let Some(ref flags) = resources.print_flags {
@@ -1408,15 +1569,24 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     }
 
     if let Some(ref group_ids) = resources.layer_group_ids {
-        typed_resources.push((1026, build_resource(1026, &|w| w.write_layer_group_ids(group_ids))?));
+        typed_resources.push((
+            1026,
+            build_resource(1026, &|w| w.write_layer_group_ids(group_ids))?,
+        ));
     }
 
     if let Some(ref grid_guides) = resources.grid_and_guides {
-        typed_resources.push((1032, build_resource(1032, &|w| w.write_grid_and_guides(grid_guides))?));
+        typed_resources.push((
+            1032,
+            build_resource(1032, &|w| w.write_grid_and_guides(grid_guides))?,
+        ));
     }
 
     if let Some(copyrighted) = resources.copyrighted {
-        typed_resources.push((1034, build_resource(1034, &|w| w.write_copyright_flag(copyrighted))?));
+        typed_resources.push((
+            1034,
+            build_resource(1034, &|w| w.write_copyright_flag(copyrighted))?,
+        ));
     }
 
     if let Some(ref url) = resources.url {
@@ -1424,11 +1594,17 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     }
 
     if let Some(angle) = resources.global_angle {
-        typed_resources.push((1037, build_resource(1037, &|w| w.write_global_angle(angle))?));
+        typed_resources.push((
+            1037,
+            build_resource(1037, &|w| w.write_global_angle(angle))?,
+        ));
     }
 
     if let Some(altitude) = resources.global_altitude {
-        typed_resources.push((1049, build_resource(1049, &|w| w.write_global_altitude(altitude))?));
+        typed_resources.push((
+            1049,
+            build_resource(1049, &|w| w.write_global_altitude(altitude))?,
+        ));
     }
 
     if let Some(ref xmp) = resources.xmp_metadata {
@@ -1436,7 +1612,10 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     }
 
     if let Some(ref digest) = resources.caption_digest {
-        typed_resources.push((1061, build_resource(1061, &|w| w.write_caption_digest(digest))?));
+        typed_resources.push((
+            1061,
+            build_resource(1061, &|w| w.write_caption_digest(digest))?,
+        ));
     }
 
     if let Some(ref scale) = resources.print_scale {
@@ -1444,43 +1623,61 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     }
 
     if let Some(ref ids) = resources.layer_selection_ids {
-        typed_resources.push((1069, build_resource(1069, &|w| w.write_layer_selection_ids(ids))?));
+        typed_resources.push((
+            1069,
+            build_resource(1069, &|w| w.write_layer_selection_ids(ids))?,
+        ));
     }
 
     if let Some(ref thumbnail) = resources.thumbnail {
-        typed_resources.push((1036, build_resource(1036, &|w| {
-            w.write_bytes(&build_thumbnail_resource(thumbnail))
-        })?));
+        typed_resources.push((
+            1036,
+            build_resource(1036, &|w| {
+                w.write_bytes(&build_thumbnail_resource(thumbnail))
+            })?,
+        ));
+    } else if let Some(ref raw) = resources.thumbnail_raw {
+        typed_resources.push((1036, build_resource(1036, &|w| w.write_bytes(raw))?));
     }
 
-    if let Some(ref info) = resources.display_info_typed {
-        typed_resources.push((1077, build_resource(1077, &|w| {
-            w.write_bytes(&build_display_info_resource(info))
-        })?));
+    if let Some(ref raw) = resources.display_info_raw {
+        typed_resources.push((1077, build_resource(1077, &|w| w.write_bytes(raw))?));
+    } else if let Some(ref info) = resources.display_info_typed {
+        typed_resources.push((
+            1077,
+            build_resource(1077, &|w| w.write_bytes(&build_display_info_resource(info)))?,
+        ));
     }
 
     if let Some(ref visibility) = resources.resource_visibility_typed {
-        typed_resources.push((1072, build_resource(1072, &|w| {
-            w.write_bytes(
-                &visibility
-                    .values
-                    .iter()
-                    .map(|v| if *v { 1 } else { 0 })
-                    .collect::<Vec<u8>>(),
-            )
-        })?));
+        typed_resources.push((
+            1072,
+            build_resource(1072, &|w| {
+                w.write_bytes(
+                    &visibility
+                        .values
+                        .iter()
+                        .map(|v| if *v { 1 } else { 0 })
+                        .collect::<Vec<u8>>(),
+                )
+            })?,
+        ));
     }
 
     if let Some(ref points) = resources.color_samplers_typed {
-        typed_resources.push((1073, build_resource(1073, &|w| {
-            w.write_bytes(&build_color_samplers_resource(points)?)
-        })?));
+        typed_resources.push((
+            1073,
+            build_resource(1073, &|w| {
+                w.write_bytes(&build_color_samplers_resource(points)?)
+            })?,
+        ));
     }
 
     if let Some(ref clipping_path_name) = resources.clipping_path_name {
-        typed_resources.push((2999, build_resource(2999, &|w| {
-            w.write_pascal_string(clipping_path_name, 2)
-        })?));
+        typed_resources.push((
+            2999,
+            build_resource(2999, &|w| w.write_pascal_string(clipping_path_name, 2))?,
+        ));
     }
 
     if let Some(ref slices) = resources.slices {
@@ -1547,33 +1744,42 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
 
     // Write alpha names (1006)
     if let Some(ref names) = resources.alpha_names {
-        typed_resources.push((1006, build_resource(1006, &|w| {
-            for name in names {
-                w.write_u8(name.len() as u8)?;
-                w.write_bytes(name.as_bytes())?;
-            }
-            Ok(())
-        })?));
+        typed_resources.push((
+            1006,
+            build_resource(1006, &|w| {
+                for name in names {
+                    w.write_u8(name.len() as u8)?;
+                    w.write_bytes(name.as_bytes())?;
+                }
+                Ok(())
+            })?,
+        ));
     }
 
     // Write alpha unicode names (1045)
     if let Some(ref names) = resources.alpha_unicode_names {
-        typed_resources.push((1045, build_resource(1045, &|w| {
-            for name in names {
-                w.write_unicode_string(name)?;
-            }
-            Ok(())
-        })?));
+        typed_resources.push((
+            1045,
+            build_resource(1045, &|w| {
+                for name in names {
+                    w.write_unicode_string(name)?;
+                }
+                Ok(())
+            })?,
+        ));
     }
 
     // Write alpha identifiers (1053)
     if let Some(ref ids) = resources.alpha_identifiers {
-        typed_resources.push((1053, build_resource(1053, &|w| {
-            for &id in ids {
-                w.write_u32(id)?;
-            }
-            Ok(())
-        })?));
+        typed_resources.push((
+            1053,
+            build_resource(1053, &|w| {
+                for &id in ids {
+                    w.write_u32(id)?;
+                }
+                Ok(())
+            })?,
+        ));
     }
 
     // Write ICC profile (1039)
@@ -1583,38 +1789,50 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
 
     // Write descriptor resources (1065, 1074, 1075)
     for (&id, desc) in &resources.descriptor_resources {
-        typed_resources.push((id, build_resource(id, &|w| {
-            w.write_bytes(&encode_be(
-                &U32ValueRecord { value: 16 },
-                "descriptor resource version",
-            )?)?;
-            w.write_descriptor_structure(desc)
-        })?));
+        typed_resources.push((
+            id,
+            build_resource(id, &|w| {
+                w.write_bytes(&encode_be(
+                    &U32ValueRecord { value: 16 },
+                    "descriptor resource version",
+                )?)?;
+                w.write_descriptor_structure(desc)
+            })?,
+        ));
     }
 
     for (&id, records) in &resources.path_resources {
-        typed_resources.push((id, build_resource(id, &|w| {
-            for record in records {
-                w.write_u16(record.record_type)?;
-                for point in record.points.iter().take(4) {
-                    w.write_i32((point.y * 16777216.0).round() as i32)?;
-                    w.write_i32((point.x * 16777216.0).round() as i32)?;
+        typed_resources.push((
+            id,
+            build_resource(id, &|w| {
+                for record in records {
+                    w.write_u16(record.record_type)?;
+                    for point in record.points.iter().take(4) {
+                        w.write_i32((point.y * 16777216.0).round() as i32)?;
+                        w.write_i32((point.x * 16777216.0).round() as i32)?;
+                    }
+                    for _ in record.points.len()..4 {
+                        w.write_i32(0)?;
+                        w.write_i32(0)?;
+                    }
+                    w.write_u16(0)?;
                 }
-                for _ in record.points.len()..4 {
-                    w.write_i32(0)?;
-                    w.write_i32(0)?;
-                }
-                w.write_u16(0)?;
-            }
-            Ok(())
-        })?));
+                Ok(())
+            })?,
+        ));
     }
 
     if let Some(ref xml) = resources.variables {
-        typed_resources.push((7000, build_resource(7000, &|w| w.write_bytes(xml.as_bytes()))?));
+        typed_resources.push((
+            7000,
+            build_resource(7000, &|w| w.write_bytes(xml.as_bytes()))?,
+        ));
     }
     if let Some(ref xml) = resources.data_sets {
-        typed_resources.push((7001, build_resource(7001, &|w| w.write_bytes(xml.as_bytes()))?));
+        typed_resources.push((
+            7001,
+            build_resource(7001, &|w| w.write_bytes(xml.as_bytes()))?,
+        ));
     }
 
     let typed_ids: HashSet<u16> = typed_resources.iter().map(|(id, _)| *id).collect();
@@ -1622,8 +1840,14 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
     for (id, bytes) in typed_resources {
         typed_by_id.entry(id).or_default().push_back(bytes);
     }
+    // Original blocks cover both unmodeled (raw_resources) and modeled
+    // (original_blocks) resources read from a file.
     let mut raw_by_id: HashMap<u16, VecDeque<Vec<u8>>> = HashMap::new();
-    for raw in &resources.raw_resources {
+    for raw in resources
+        .raw_resources
+        .iter()
+        .chain(resources.original_blocks.iter())
+    {
         raw_by_id
             .entry(raw.resource_id)
             .or_default()
@@ -1632,6 +1856,37 @@ pub fn write_image_resources(writer: &mut PsdWriter, resources: &ImageResources)
 
     if !resources.resource_order.is_empty() {
         for resource_id in &resources.resource_order {
+            // A typed payload takes precedence over the original envelope only
+            // when it was actually changed (its bytes no longer match the
+            // original payload). An unchanged typed mirror is suppressed so
+            // the verbatim original block - with its name, signature, version
+            // words, duplicates and trailing bytes - is written instead.
+            if let Some(t_queue) = typed_by_id.get_mut(resource_id) {
+                if let Some(typed) = t_queue.front().cloned() {
+                    if let Some(raw) = raw_by_id
+                        .get_mut(resource_id)
+                        .and_then(|q| q.front().cloned())
+                    {
+                        let matches = match (raw_block_payload(&raw), typed_block_payload(&typed)) {
+                            (Some(r), Some(t)) => r.len() >= t.len() && r.starts_with(t),
+                            _ => false,
+                        };
+                        if matches {
+                            // Unmodified: original envelope wins.
+                            writer.write_bytes(&raw)?;
+                            raw_by_id.get_mut(resource_id).unwrap().pop_front();
+                            t_queue.pop_front();
+                            continue;
+                        }
+                        // Semantic edit: regenerate and drop the original
+                        // envelope(s) of this id.
+                        writer.write_bytes(&typed)?;
+                        t_queue.pop_front();
+                        raw_by_id.remove(resource_id);
+                        continue;
+                    }
+                }
+            }
             if let Some(queue) = raw_by_id.get_mut(resource_id) {
                 if let Some(bytes) = queue.pop_front() {
                     writer.write_bytes(&bytes)?;
@@ -1686,11 +1941,8 @@ mod tests {
             if (name_len + 1) % 2 != 0 {
                 pos += 1;
             }
-            let length: ImageResourceLengthRecord = decode_be(
-                &bytes[pos..pos + 4],
-                "image resource length",
-            )
-            .expect("length");
+            let length: ImageResourceLengthRecord =
+                decode_be(&bytes[pos..pos + 4], "image resource length").expect("length");
             pos += 4;
             ids.push(header.resource_id);
             pos += length.data_length as usize;
@@ -1862,14 +2114,17 @@ mod tests {
         let mut bytes = Vec::new();
         let mut writer = PsdWriter::new(64);
         writer
-            .write_bytes(&encode_be(
-                &ImageResourceHeaderRecord {
-                    signature: *b"8BIM",
-                    resource_id: 8000,
-                    name_length: 0,
-                },
-                "image resource header",
-            ).unwrap())
+            .write_bytes(
+                &encode_be(
+                    &ImageResourceHeaderRecord {
+                        signature: *b"8BIM",
+                        resource_id: 8000,
+                        name_length: 0,
+                    },
+                    "image resource header",
+                )
+                .unwrap(),
+            )
             .unwrap();
         writer.write_u8(0).unwrap();
         writer
@@ -1878,14 +2133,17 @@ mod tests {
         writer.write_u8(1).unwrap();
         writer.write_u8(0).unwrap();
         writer
-            .write_bytes(&encode_be(
-                &ImageResourceHeaderRecord {
-                    signature: *b"8BIM",
-                    resource_id: 8001,
-                    name_length: 0,
-                },
-                "image resource header",
-            ).unwrap())
+            .write_bytes(
+                &encode_be(
+                    &ImageResourceHeaderRecord {
+                        signature: *b"8BIM",
+                        resource_id: 8001,
+                        name_length: 0,
+                    },
+                    "image resource header",
+                )
+                .unwrap(),
+            )
             .unwrap();
         writer.write_u8(0).unwrap();
         writer
@@ -1894,14 +2152,17 @@ mod tests {
         writer.write_u8(2).unwrap();
         writer.write_u8(0).unwrap();
         writer
-            .write_bytes(&encode_be(
-                &ImageResourceHeaderRecord {
-                    signature: *b"8BIM",
-                    resource_id: 8000,
-                    name_length: 0,
-                },
-                "image resource header",
-            ).unwrap())
+            .write_bytes(
+                &encode_be(
+                    &ImageResourceHeaderRecord {
+                        signature: *b"8BIM",
+                        resource_id: 8000,
+                        name_length: 0,
+                    },
+                    "image resource header",
+                )
+                .unwrap(),
+            )
             .unwrap();
         writer.write_u8(0).unwrap();
         writer
@@ -1954,14 +2215,17 @@ mod tests {
     fn mixed_modeled_and_unknown_image_resources_preserve_original_order() {
         let mut original = PsdWriter::new(128);
         original
-            .write_bytes(&encode_be(
-                &ImageResourceHeaderRecord {
-                    signature: *b"8BIM",
-                    resource_id: 8000,
-                    name_length: 0,
-                },
-                "image resource header",
-            ).unwrap())
+            .write_bytes(
+                &encode_be(
+                    &ImageResourceHeaderRecord {
+                        signature: *b"8BIM",
+                        resource_id: 8000,
+                        name_length: 0,
+                    },
+                    "image resource header",
+                )
+                .unwrap(),
+            )
             .unwrap();
         original.write_u8(0).unwrap();
         original
@@ -1982,14 +2246,17 @@ mod tests {
         write_image_resources(&mut typed_writer, &typed).unwrap();
         original.write_bytes(&typed_writer.into_buffer()).unwrap();
         original
-            .write_bytes(&encode_be(
-                &ImageResourceHeaderRecord {
-                    signature: *b"8BIM",
-                    resource_id: 8001,
-                    name_length: 0,
-                },
-                "image resource header",
-            ).unwrap())
+            .write_bytes(
+                &encode_be(
+                    &ImageResourceHeaderRecord {
+                        signature: *b"8BIM",
+                        resource_id: 8001,
+                        name_length: 0,
+                    },
+                    "image resource header",
+                )
+                .unwrap(),
+            )
             .unwrap();
         original.write_u8(0).unwrap();
         original
@@ -2014,7 +2281,10 @@ mod tests {
         let orig_resources = &original[34..34 + orig_len];
         let original_ids = parse_resource_ids(orig_resources);
 
-        let mut reader = PsdReader::new(std::io::Cursor::new(orig_resources.to_vec()), Default::default());
+        let mut reader = PsdReader::new(
+            std::io::Cursor::new(orig_resources.to_vec()),
+            Default::default(),
+        );
         let resources = read_image_resources(&mut reader, orig_resources.len()).unwrap();
         let mut out = PsdWriter::new(orig_resources.len() + 1024);
         write_image_resources(&mut out, &resources).unwrap();
@@ -2386,5 +2656,125 @@ mod tests {
         let mut reader = PsdReader::new(std::io::Cursor::new(buf), Default::default());
         let resources = read_image_resources(&mut reader, len).unwrap();
         assert_eq!(resources.icc_profile, Some(vec![1, 2, 3, 4]));
+    }
+
+    fn append_resource_block(target: &mut Vec<u8>, resource_id: u16, name: &[u8], payload: &[u8]) {
+        target.extend_from_slice(b"8BIM");
+        target.extend_from_slice(&resource_id.to_be_bytes());
+        target.push(name.len() as u8);
+        target.extend_from_slice(name);
+        if (name.len() + 1) % 2 != 0 {
+            target.push(0);
+        }
+        target.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        target.extend_from_slice(payload);
+        if payload.len() % 2 != 0 {
+            target.push(0);
+        }
+    }
+
+    #[test]
+    fn named_modeled_resource_round_trips_byte_identically() {
+        // A modeled resource with a non-empty name and a trailing suffix byte
+        // inside its payload must survive a save verbatim: the typed value
+        // (global angle 90) is a prefix of the original payload.
+        let mut bytes = Vec::new();
+        append_resource_block(&mut bytes, 1037, b"Angle", &[0, 0, 0, 90, 0xBE]);
+        let len = bytes.len();
+        let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
+        let resources = read_image_resources(&mut reader, len).unwrap();
+        assert_eq!(resources.global_angle, Some(90));
+        assert_eq!(resources.original_blocks.len(), 1);
+        assert_eq!(resources.original_blocks[0].resource_id, 1037);
+
+        let mut out = PsdWriter::new(64);
+        write_image_resources(&mut out, &resources).unwrap();
+        assert_eq!(out.into_buffer(), bytes);
+    }
+
+    #[test]
+    fn duplicate_modeled_resources_keep_multiplicity_and_order() {
+        let mut bytes = Vec::new();
+        append_resource_block(&mut bytes, 1037, b"First", &[0, 0, 0, 90]);
+        append_resource_block(&mut bytes, 8001, b"", &[7]);
+        append_resource_block(&mut bytes, 1037, b"Last", &[0, 0, 0, 90, 0xAA, 0xBB]);
+        let len = bytes.len();
+        let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
+        let resources = read_image_resources(&mut reader, len).unwrap();
+        assert_eq!(resources.resource_order, vec![1037, 8001, 1037]);
+        assert_eq!(resources.original_blocks.len(), 2);
+
+        let mut out = PsdWriter::new(64);
+        write_image_resources(&mut out, &resources).unwrap();
+        assert_eq!(out.into_buffer(), bytes);
+    }
+
+    #[test]
+    fn unparseable_display_info_payload_is_retained_not_dropped() {
+        // 1077 payload shorter than the 28-byte typed model: typed parse is
+        // None, yet the payload must not disappear on save.
+        let mut bytes = Vec::new();
+        append_resource_block(
+            &mut bytes,
+            1077,
+            b"",
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+        );
+        let len = bytes.len();
+        let mut reader = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
+        let resources = read_image_resources(&mut reader, len).unwrap();
+        assert!(resources.display_info_typed.is_none());
+        assert_eq!(
+            resources.display_info_raw.as_deref(),
+            Some(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12][..])
+        );
+
+        let mut out = PsdWriter::new(64);
+        write_image_resources(&mut out, &resources).unwrap();
+        assert_eq!(out.into_buffer(), bytes);
+    }
+
+    #[test]
+    fn strict_mode_rejects_malformed_display_info_payload() {
+        let mut bytes = Vec::new();
+        append_resource_block(&mut bytes, 1077, b"", &[1, 2, 3]);
+        let len = bytes.len();
+        let mut reader = PsdReader::new(
+            std::io::Cursor::new(bytes),
+            ReadOptions {
+                strict: Some(true),
+                ..Default::default()
+            },
+        );
+        let err = read_image_resources(&mut reader, len).unwrap_err();
+        assert!(
+            err.to_string().contains("display-info"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn edited_modeled_resource_replaces_original_envelope() {
+        let mut bytes = Vec::new();
+        append_resource_block(&mut bytes, 1037, b"Angle", &[0, 0, 0, 90]);
+        let len = bytes.len();
+        let mut reader = PsdReader::new(std::io::Cursor::new(bytes), Default::default());
+        let mut resources = read_image_resources(&mut reader, len).unwrap();
+
+        // Semantic edit: 90 -> 91. The regenerated resource must win over the
+        // stale original envelope (which carried the old value and a name).
+        resources.global_angle = Some(91);
+        let mut out = PsdWriter::new(64);
+        write_image_resources(&mut out, &resources).unwrap();
+        let out = out.into_buffer();
+        assert!(
+            out.windows(4).any(|w| w == [0, 0, 0, 91]),
+            "regenerated payload missing"
+        );
+        assert!(
+            !out.windows(5).any(|w| w == b"Angle"),
+            "stale envelope retained"
+        );
     }
 }

@@ -110,7 +110,9 @@ impl ColorMode {
             7 => Ok(ColorMode::Multichannel),
             8 => Ok(ColorMode::Duotone),
             9 => Ok(ColorMode::Lab),
-            _ => Err(crate::support::error::PsdError::InvalidColorMode(value as u8)),
+            _ => Err(crate::support::error::PsdError::InvalidColorMode(
+                value as u8,
+            )),
         }
     }
 }
@@ -591,18 +593,23 @@ pub enum LayerColor {
 
 /// Channel ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i16)]
 pub enum ChannelID {
-    Color0 = 0,
-    Color1 = 1,
-    Color2 = 2,
-    Color3 = 3,
-    Transparency = -1,
-    UserMask = -2,
-    RealUserMask = -3,
+    Color0,
+    Color1,
+    Color2,
+    Color3,
+    Transparency,
+    UserMask,
+    RealUserMask,
+    /// Any other signed channel ID encountered on the wire (saved alpha/spot
+    /// channels, unusual negative IDs). Carried verbatim so it is never
+    /// conflated with a color channel.
+    Other(i16),
 }
 
 impl ChannelID {
+    /// Map a wire channel ID to a typed value, preserving unknown IDs rather
+    /// than collapsing them onto a valid color channel.
     pub fn from_i16(value: i16) -> Self {
         match value {
             0 => ChannelID::Color0,
@@ -612,7 +619,21 @@ impl ChannelID {
             -1 => ChannelID::Transparency,
             -2 => ChannelID::UserMask,
             -3 => ChannelID::RealUserMask,
-            _ => ChannelID::Color0, // Default fallback
+            other => ChannelID::Other(other),
+        }
+    }
+
+    /// The raw wire value of this channel ID.
+    pub fn as_i16(self) -> i16 {
+        match self {
+            ChannelID::Color0 => 0,
+            ChannelID::Color1 => 1,
+            ChannelID::Color2 => 2,
+            ChannelID::Color3 => 3,
+            ChannelID::Transparency => -1,
+            ChannelID::UserMask => -2,
+            ChannelID::RealUserMask => -3,
+            ChannelID::Other(value) => value,
         }
     }
 }
@@ -722,5 +743,29 @@ mod color_mode_tests {
             let mode = ColorMode::from_u16(v).expect("should parse");
             assert_eq!(mode as u16, v);
         }
+    }
+}
+
+#[cfg(test)]
+mod channel_id_tests {
+    use super::*;
+
+    #[test]
+    fn known_channel_ids_round_trip() {
+        for v in [0i16, 1, 2, 3, -1, -2, -3] {
+            assert_eq!(ChannelID::from_i16(v).as_i16(), v);
+        }
+    }
+
+    #[test]
+    fn unknown_channel_ids_are_preserved_not_mapped_to_color() {
+        // Saved alpha/spot channels and unusual negative IDs must not collapse
+        // onto a valid color channel.
+        for v in [4i16, 5, 100, -4, -5, 7] {
+            let id = ChannelID::from_i16(v);
+            assert_eq!(id, ChannelID::Other(v));
+            assert_eq!(id.as_i16(), v);
+        }
+        assert_ne!(ChannelID::from_i16(4), ChannelID::Color0);
     }
 }

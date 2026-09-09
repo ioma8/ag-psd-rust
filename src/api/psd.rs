@@ -1,6 +1,6 @@
-use crate::format::additional_info::LayerAdditionalInfo;
 use crate::api::layer::{Layer, LinkedFile};
 use crate::api::types::*;
+use crate::format::additional_info::LayerAdditionalInfo;
 
 /// Animations definition
 #[derive(Debug, Clone, PartialEq)]
@@ -298,6 +298,24 @@ pub struct ColorModeSectionData {
     pub bytes: Vec<u8>,
 }
 
+/// Native merged-composite planes as decoded from the file.
+///
+/// The public `image_data` preview cannot represent every mode/depth without
+/// loss (16/32-bit samples, CMYK, saved alpha/spot planes). These planes keep
+/// the original samples so an unchanged save rewrites them verbatim instead of
+/// quantizing through the 8-bit RGBA preview.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompositeNativeData {
+    pub bits_per_channel: u16,
+    pub color_mode: crate::api::types::ColorMode,
+    /// One plane per header channel, each `width * height` native samples.
+    pub channels: Vec<Vec<u8>>,
+    /// The RGBA preview computed when the planes were decoded. Writing prefers
+    /// the native planes only while `image_data` still equals this preview;
+    /// any edit to the preview invalidates them.
+    pub preview: Vec<u8>,
+}
+
 /// Main PSD document structure
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Psd {
@@ -309,6 +327,18 @@ pub struct Psd {
     pub palette: Option<Vec<RGB>>,
     pub children: Option<Vec<Layer>>,
     pub image_data: Option<PixelData>,
+    /// True when the composite image data was skipped on read
+    /// (`skip_composite_image_data`). Writing such a document must not
+    /// silently synthesize black pixels for the unloaded composite.
+    pub composite_skipped: bool,
+    /// True when layer channel payloads were skipped on read.
+    pub layer_image_data_skipped: bool,
+    /// True when linked-file payloads were skipped on read.
+    pub linked_files_data_skipped: bool,
+    /// Native composite planes retained from the last read (see
+    /// [`CompositeNativeData`]); `None` for new documents or after the
+    /// preview is edited.
+    pub composite_native: Option<CompositeNativeData>,
     pub image_resources: Option<crate::format::image_resources::ImageResources>,
     pub linked_files: Option<Vec<LinkedFile>>,
     pub artboards: Option<ArtboardsInfo>,
@@ -361,6 +391,8 @@ pub struct ReadOptions {
 /// Write options for PSD generation
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct WriteOptions {
+    pub overwrite_skipped_composite: Option<bool>,
+    pub overwrite_skipped_thumbnail: Option<bool>,
     pub generate_thumbnail: Option<bool>,
     pub trim_image_data: Option<bool>,
     pub invalidate_text_layers: Option<bool>,

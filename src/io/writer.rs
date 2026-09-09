@@ -2,6 +2,10 @@
 //!
 //! Provides functionality to write PSD files.
 
+use crate::api::layer::Layer;
+use crate::api::psd::{GlobalLayerMaskInfo, Psd, WriteOptions};
+use crate::api::types::{BlendMode, ChannelID, Color, ColorMode, Compression};
+use crate::format::additional_info::SectionDivider;
 use crate::support::binrw_support::{
     encode_be, ChannelInfoRecord, GlobalLayerMaskRecord, LayerBlendRecord, LayerMaskPrefixRecord,
     LayerRecordBounds, PsbChannelInfoRecord, PsdHeaderRecord,
@@ -11,10 +15,6 @@ use crate::support::error::{PsdError, Result};
 use crate::support::helpers::{
     clamp, from_blend_mode, has_alpha, LayerBlendFlags, LayerMaskParameterFlags, LayerMaskStateBits,
 };
-use crate::api::layer::Layer;
-use crate::api::psd::{GlobalLayerMaskInfo, Psd, WriteOptions};
-use crate::api::types::{BlendMode, ChannelID, Color, ColorMode, Compression};
-use crate::format::additional_info::SectionDivider;
 use byteorder::{BigEndian, WriteBytesExt};
 use std::io::Cursor;
 
@@ -22,6 +22,11 @@ use std::io::Cursor;
 pub struct PsdWriter {
     buffer: Vec<u8>,
     pub offset: usize,
+    /// PSB (large) record layout in effect for structures this writer emits,
+    /// so nested Lr16/Lr32 blocks can use document-consistent widths.
+    pub large: bool,
+    pub color_mode: ColorMode,
+    pub global_alpha: bool,
 }
 
 impl PsdWriter {
@@ -30,6 +35,9 @@ impl PsdWriter {
         Self {
             buffer: Vec::with_capacity(capacity),
             offset: 0,
+            large: false,
+            color_mode: ColorMode::RGB,
+            global_alpha: false,
         }
     }
 
@@ -179,6 +187,37 @@ impl PsdWriter {
         Ok(())
     }
 
+    /// Write the legacy Pascal layer name.
+    ///
+    /// The PSD layer record limits this field to 255 bytes, but the full
+    /// Unicode name lives in the `luni` tagged block, so the legacy field is
+    /// truncated to fit instead of failing the whole write. Non-ASCII
+    /// characters map to `?` one per character so multibyte UTF-8 never
+    /// produces several question marks per character.
+    pub fn write_legacy_pascal_layer_name(&mut self, text: &str, pad_to: usize) -> Result<()> {
+        let mut length: usize = 0;
+        let mut units: Vec<u8> = Vec::new();
+        for ch in text.chars() {
+            let mapped: u8 = if ch.is_ascii() { ch as u8 } else { b'?' };
+            if length == 255 {
+                break;
+            }
+            units.push(mapped);
+            length += 1;
+        }
+
+        self.write_u8(length as u8)?;
+        self.write_bytes(&units)?;
+
+        let mut padded_length = length + 1; // Include length byte
+        while padded_length % pad_to != 0 {
+            self.write_u8(0)?;
+            padded_length += 1;
+        }
+
+        Ok(())
+    }
+
     /// Write a Unicode string (UTF-16 BE)
     pub fn write_unicode_string(&mut self, text: &str) -> Result<()> {
         let units: Vec<u16> = text.encode_utf16().collect();
@@ -229,7 +268,14 @@ impl PsdWriter {
         func(self)?;
 
         // Record content length BEFORE padding
-        let content_length = (self.offset - start_offset) as u32;
+        let content_length = (self.offset - start_offset) as u64;
+        if content_length > u32::MAX as u64 {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "Section of {} bytes exceeds the 4GiB wire limit",
+                content_length
+            )));
+        }
+        let content_length = content_length as u32;
         let mut padded_length = content_length;
         while padded_length % round as u32 != 0 {
             padded_length += 1;
@@ -329,10 +375,69 @@ impl PsdWriter {
     }
 }
 
+/// Channel count to use when an unchanged native composite is available.
+fn active_native_channel_count(
+    psd: &Psd,
+    bits_per_channel: u8,
+    color_mode: ColorMode,
+) -> Option<usize> {
+    let native = psd.composite_native.as_ref()?;
+    if native.bits_per_channel as u8 != bits_per_channel || native.color_mode != color_mode {
+        return None;
+    }
+    let preview_unchanged = match psd.image_data.as_ref() {
+        Some(image) => image.data == native.preview,
+        None => native.preview.is_empty(),
+    };
+    if !preview_unchanged || native.channels.is_empty() {
+        return None;
+    }
+    Some(native.channels.len())
+}
+
 /// Write a PSD file
 pub fn write_psd(psd: &Psd, options: &WriteOptions) -> Result<Vec<u8>> {
     if psd.width == 0 || psd.height == 0 {
         return Err(PsdError::InvalidFormat("Invalid document size".to_string()));
+    }
+    // A document whose composite was skipped on read must not be silently
+    // rewritten with synthesized black pixels unless explicitly requested.
+    if psd.composite_skipped
+        && psd.image_data.is_none()
+        && psd.composite_native.is_none()
+        && !options.overwrite_skipped_composite.unwrap_or(false)
+    {
+        return Err(PsdError::UnsupportedFeature(
+            "document composite image data was skipped on read; \
+             refusing to synthesize replacement pixels (set \
+             WriteOptions::overwrite_skipped_composite to override)"
+                .to_string(),
+        ));
+    }
+    if psd.layer_image_data_skipped && !options.overwrite_skipped_composite.unwrap_or(false) {
+        return Err(PsdError::UnsupportedFeature(
+            "layer image data was skipped on read; refusing to synthesize replacement pixels (set WriteOptions::overwrite_skipped_composite to override)".to_string(),
+        ));
+    }
+    if psd.linked_files_data_skipped && !options.overwrite_skipped_composite.unwrap_or(false) {
+        return Err(PsdError::UnsupportedFeature(
+            "linked-file payloads were skipped on read; refusing to synthesize empty payloads (set WriteOptions::overwrite_skipped_composite to override)".to_string(),
+        ));
+    }
+    // Options that are part of the public surface but not implemented return
+    // an explicit error when requested, instead of silently doing nothing.
+    for (name, requested) in [
+        ("generate_thumbnail", options.generate_thumbnail),
+        ("trim_image_data", options.trim_image_data),
+        ("no_background", options.no_background),
+        ("log_missing_features", options.log_missing_features),
+    ] {
+        if requested == Some(true) {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "WriteOptions::{} is not implemented",
+                name
+            )));
+        }
     }
 
     let max_size = if options.psb.unwrap_or(false) {
@@ -356,6 +461,7 @@ pub fn write_psd(psd: &Psd, options: &WriteOptions) -> Result<Vec<u8>> {
     }
 
     let mut writer = PsdWriter::new(1024 * 1024); // 1MB initial capacity
+    writer.large = options.psb.unwrap_or(false);
 
     let color_mode = psd.color_mode.unwrap_or(ColorMode::RGB);
     let global_alpha = if let Some(ref image_data) = psd.image_data {
@@ -363,15 +469,56 @@ pub fn write_psd(psd: &Psd, options: &WriteOptions) -> Result<Vec<u8>> {
     } else {
         false
     };
-    let base_channels = match color_mode {
-        ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Indexed => 1,
-        ColorMode::CMYK => 4,
-        _ => 3,
+    // The header channel count and the planes emitted in the image-data
+    // section agree: native planes when an unchanged save can reuse them,
+    // otherwise one shared plan.
+    let bits_per_channel = psd.bits_per_channel.unwrap_or(8);
+    let declared_alpha = psd
+        .channels
+        .map(|channels| {
+            let base = match color_mode {
+                ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Indexed => 1,
+                ColorMode::CMYK => 4,
+                _ => 3,
+            };
+            channels as usize == base + 1
+        })
+        .unwrap_or(false);
+    let global_alpha = global_alpha || declared_alpha;
+    writer.color_mode = color_mode;
+    writer.global_alpha = global_alpha;
+    let channel_count = match active_native_channel_count(psd, bits_per_channel, color_mode) {
+        Some(native_channels) => native_channels as u16,
+        None => composite_plan(color_mode, global_alpha, psd.image_data.is_some())?.len() as u16,
     };
-    let channel_count = (base_channels + usize::from(global_alpha)) as u16;
+    if let Some(declared_channels) = psd.channels {
+        if declared_channels > channel_count {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "document declares {} composite channels but the available data provides {}; refusing to drop channels",
+                declared_channels, channel_count
+            )));
+        }
+    }
+    if channel_count == 0 || channel_count > 56 {
+        return Err(PsdError::InvalidFormat(format!(
+            "Invalid composite channel count: {}",
+            channel_count
+        )));
+    }
 
     // Apply prewrite passes
     let mut psd = psd.clone();
+    if options.overwrite_skipped_thumbnail.unwrap_or(false) {
+        if let Some(resources) = psd.image_resources.as_mut() {
+            if resources.thumbnail_skipped {
+                resources.thumbnail_skipped = false;
+                resources.thumbnail_raw = None;
+            }
+        }
+    }
+    if options.invalidate_text_layers.unwrap_or(false) {
+        crate::format::additional_info::invalidate_text_layer_caches(&mut psd);
+    }
     apply_resource_prewrite(&mut psd);
     crate::format::document_resource_postprocess::apply_document_prewrite(&mut psd)?;
     apply_text_prewrite(&mut psd)?;
@@ -479,21 +626,21 @@ fn write_layer_info(
     writer.write_section_with_length_mode(2, psb, true, |writer| {
         let layers = flatten_layers(psd.children.as_ref());
         let color_mode = psd.color_mode.unwrap_or(ColorMode::RGB);
-        if color_mode != ColorMode::RGB {
-            // ponytail: synthesized layer channels are RGB-only; non-RGB layer pixels
-            // roundtrip via raw_data. Add CMYK/Grayscale synthesis when needed.
-            let has_synthesized = layers
-                .iter()
-                .any(|layer| layer.raw_data.is_none() && layer.image_data.is_some());
+        if !matches!(color_mode, ColorMode::RGB | ColorMode::Grayscale) {
+            // CMYK/Indexed/Bitmap samples cannot be reconstructed from the
+            // 8-bit RGBA preview; require the retained native channels.
+            let has_synthesized = layers.iter().any(|layer| {
+                !layer_raw_is_current(layer) && layer.image_data.is_some()
+            });
             if has_synthesized {
                 return Err(PsdError::UnsupportedFeature(format!(
-                    "Writing layers without raw channel data is only supported in RGB mode (document is {color_mode:?})"
+                    "Writing layers without current raw channel data is only supported in RGB mode (document is {color_mode:?})"
                 )));
             }
         }
         let prepared_payloads: Vec<PreparedLayerChannels> = layers
             .iter()
-            .map(|layer| prepare_layer_channels(layer, bits_per_channel, options))
+            .map(|layer| prepare_layer_channels(layer, color_mode, bits_per_channel, options))
             .collect::<Result<Vec<PreparedLayerChannels>>>()?;
 
         let layer_count = if global_alpha {
@@ -541,15 +688,19 @@ pub(crate) fn flatten_layers(children: Option<&Vec<Layer>>) -> Vec<Layer> {
                 // Add the real folder marker last.
                 let mut folder = child.clone();
                 folder.children = None;
-                let mut divider = folder.additional_info.section_divider.unwrap_or(SectionDivider {
-                    divider_type: if child.opened.unwrap_or(true) {
-                        crate::api::types::SectionDividerType::OpenFolder
-                    } else {
-                        crate::api::types::SectionDividerType::ClosedFolder
-                    },
-                    blend_mode: None,
-                    sub_type: None,
-                });
+                let mut divider =
+                    folder
+                        .additional_info
+                        .section_divider
+                        .unwrap_or(SectionDivider {
+                            divider_type: if child.opened.unwrap_or(true) {
+                                crate::api::types::SectionDividerType::OpenFolder
+                            } else {
+                                crate::api::types::SectionDividerType::ClosedFolder
+                            },
+                            blend_mode: None,
+                            sub_type: None,
+                        });
                 divider.divider_type = if child.opened.unwrap_or(true) {
                     crate::api::types::SectionDividerType::OpenFolder
                 } else {
@@ -604,21 +755,31 @@ fn write_layer_record(
     )?)?;
 
     for entry in &channel_payloads.entries {
-        let channel_payload_len = entry.payload.len() as u32;
+        // The wire length includes the 2-byte compression header, so the
+        // payload itself must fit in u32::MAX - 2.
+        let wire_len = u32::try_from(entry.payload.len())
+            .ok()
+            .and_then(|len| len.checked_add(2))
+            .ok_or_else(|| {
+                PsdError::UnsupportedFeature(format!(
+                    "Channel payload of {} bytes exceeds the 4GiB wire limit",
+                    entry.payload.len()
+                ))
+            })?;
         if psb {
             writer.write_bytes(&encode_be(
                 &PsbChannelInfoRecord {
-                    id: entry.id as i16,
+                    id: entry.id.as_i16(),
                     high_length: 0,
-                    low_length: channel_payload_len + 2,
+                    low_length: wire_len,
                 },
                 "PSB channel info",
             )?)?;
         } else {
             writer.write_bytes(&encode_be(
                 &ChannelInfoRecord {
-                    id: entry.id as i16,
-                    length: channel_payload_len + 2,
+                    id: entry.id.as_i16(),
+                    length: wire_len,
                 },
                 "channel info",
             )?)?;
@@ -630,21 +791,39 @@ fn write_layer_record(
     let mut blend_mode_raw = [0u8; 4];
     blend_mode_raw.copy_from_slice(blend_mode_sig.as_bytes());
     let opacity = layer.opacity.unwrap_or(1.0);
-    let mut flags = LayerBlendFlags::PHOTOSHOP_5;
-    if layer.transparency_protected.unwrap_or(false) {
-        flags |= LayerBlendFlags::TRANSPARENCY_PROTECTED;
+    // Rebuild the record flag byte: start from the original wire flags when
+    // the layer was loaded (preserving unmodeled and pixel-data-irrelevant
+    // bits), otherwise the standard Photoshop 5 defaults, then apply the typed
+    // accessors that are explicitly present.
+    let mut flags = match layer.raw_blend_flags {
+        Some(original) => LayerBlendFlags::from_bits_retain(original),
+        None => LayerBlendFlags::PHOTOSHOP_5,
+    };
+    match layer.transparency_protected {
+        Some(true) => flags |= LayerBlendFlags::TRANSPARENCY_PROTECTED,
+        Some(false) => flags.remove(LayerBlendFlags::TRANSPARENCY_PROTECTED),
+        None => {}
     }
-    if layer.hidden.unwrap_or(false) {
-        flags |= LayerBlendFlags::HIDDEN;
+    match layer.hidden {
+        Some(true) => flags |= LayerBlendFlags::HIDDEN,
+        Some(false) => flags.remove(LayerBlendFlags::HIDDEN),
+        None => {}
     }
+    let clipping = layer.clipping.unwrap_or(0);
+    let clipping_byte = u8::try_from(clipping).map_err(|_| {
+        PsdError::UnsupportedFeature(format!(
+            "Layer clipping value {} does not fit the wire byte",
+            clipping
+        ))
+    })?;
     writer.write_bytes(&encode_be(
         &LayerBlendRecord {
             signature: *b"8BIM",
             blend_mode: blend_mode_raw,
             opacity: (clamp(opacity, 0.0, 1.0) * 255.0).round() as u8,
-            // TS always writes 0 here and uses image resource 1026 as the
-            // semantic clipping source.
-            clipping: 0,
+            // The layer record has its own clipping byte. Resource 1026 holds
+            // dragging-group IDs, which is a separate concept.
+            clipping: clipping_byte,
             flags: flags.bits(),
             filler: 0,
         },
@@ -670,6 +849,12 @@ fn write_layer_record(
                     || mask.user_mask_feather.is_some()
                     || mask.vector_mask_density.is_some()
                     || mask.vector_mask_feather.is_some();
+                let has_real = mask.real_flags_byte.is_some()
+                    || mask.real_default_color.is_some()
+                    || mask.real_top.is_some()
+                    || mask.real_left.is_some()
+                    || mask.real_bottom.is_some()
+                    || mask.real_right.is_some();
                 if has_params {
                     flags |= LayerMaskStateBits::HAS_PARAMETERS;
                 }
@@ -684,16 +869,8 @@ fn write_layer_record(
                     },
                     "layer mask prefix",
                 )?)?;
+                // Parameters precede the optional real-mask structure.
                 if has_params {
-                    // Only write real-mask block when real mask data is present
-                    if mask.real_flags_byte.is_some() {
-                        writer.write_u8(mask.real_flags_byte.unwrap_or(0))?;
-                        writer.write_u8(mask.real_default_color.unwrap_or(0))?;
-                        writer.write_i32(mask.real_top.unwrap_or(0))?;
-                        writer.write_i32(mask.real_left.unwrap_or(0))?;
-                        writer.write_i32(mask.real_bottom.unwrap_or(0))?;
-                        writer.write_i32(mask.real_right.unwrap_or(0))?;
-                    }
                     let mut param_flags = LayerMaskParameterFlags::empty();
                     if mask.user_mask_density.is_some() {
                         param_flags |= LayerMaskParameterFlags::USER_MASK_DENSITY;
@@ -721,11 +898,14 @@ fn write_layer_record(
                         writer.write_f64(v)?;
                     }
                 }
-            }
-            // Write uV filler block (required by some Photoshop versions)
-            if layer.additional_info.mask.is_some() {
-                writer.write_u16(0x0006)?;
-                writer.write_zeros(38)?;
+                if has_real {
+                    writer.write_u8(mask.real_flags_byte.unwrap_or(0))?;
+                    writer.write_u8(mask.real_default_color.unwrap_or(0))?;
+                    writer.write_i32(mask.real_top.unwrap_or(0))?;
+                    writer.write_i32(mask.real_left.unwrap_or(0))?;
+                    writer.write_i32(mask.real_bottom.unwrap_or(0))?;
+                    writer.write_i32(mask.real_right.unwrap_or(0))?;
+                }
             }
             Ok(())
         })?;
@@ -740,9 +920,11 @@ fn write_layer_record(
             Ok(())
         })?;
 
-        // Write layer name
+        // Write layer name (legacy Pascal string; the full Unicode name is
+        // carried by the luni tagged block, so the legacy field may be safely
+        // truncated when it cannot fit 255 bytes).
         let name = layer.additional_info.name.as_deref().unwrap_or("");
-        writer.write_pascal_string(name, 4)?;
+        writer.write_legacy_pascal_layer_name(name, 4)?;
 
         // Write tagged blocks (additional layer info)
         crate::format::additional_info::write_layer_additional_info_with_options(
@@ -775,14 +957,24 @@ pub(crate) fn write_nested_layer_info_block(
     layers: &[Layer],
     bits_per_channel: u8,
 ) -> Result<()> {
-    let options = WriteOptions::default();
+    // Nested high-depth records follow the enclosing document's layout: PSB
+    // uses large row counts and channel records even inside an 8B64 block.
+    let options = WriteOptions {
+        psb: Some(writer.large),
+        ..Default::default()
+    };
     let flattened = flatten_layers(Some(&layers.to_vec()));
     let prepared_payloads: Vec<PreparedLayerChannels> = flattened
         .iter()
-        .map(|layer| prepare_layer_channels(layer, bits_per_channel, &options))
+        .map(|layer| prepare_layer_channels(layer, writer.color_mode, bits_per_channel, &options))
         .collect::<Result<Vec<PreparedLayerChannels>>>()?;
 
-    writer.write_i16(layer_count_i16(flattened.len())?)?;
+    let layer_count = layer_count_i16(flattened.len())?;
+    writer.write_i16(if writer.global_alpha {
+        -layer_count
+    } else {
+        layer_count
+    })?;
     for (layer, prepared) in flattened.iter().zip(prepared_payloads.iter()) {
         write_layer_record(writer, layer, prepared, &options)?;
     }
@@ -815,6 +1007,184 @@ fn write_global_layer_mask_info(
     })
 }
 
+/// Source of one composite channel plane.
+///
+/// `Red`/`Green`/`Blue`/`Alpha` read the named component of an RGBA preview;
+/// `Gray` reads the red component, which is where the reader stores the
+/// gray sample of a Grayscale document. `Zero` fills with zeros (new blank
+/// documents, or a native channel that has no preview counterpart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompositePlane {
+    Red,
+    Green,
+    Blue,
+    Gray,
+    Alpha,
+    Zero,
+}
+
+/// The validated composite channel plan for a document.
+///
+/// This is the single source of truth for the header channel count and the
+/// planes emitted in the image-data section, so a successful write always
+/// agrees with its own header. Modes whose native samples cannot be derived
+/// from an RGBA preview are rejected instead of emitting silently mis-encoded
+/// data.
+fn composite_plan(
+    color_mode: ColorMode,
+    global_alpha: bool,
+    has_preview: bool,
+) -> Result<Vec<CompositePlane>> {
+    let mut plan = match color_mode {
+        ColorMode::Grayscale => vec![CompositePlane::Gray],
+        ColorMode::RGB => vec![
+            CompositePlane::Red,
+            CompositePlane::Green,
+            CompositePlane::Blue,
+        ],
+        ColorMode::Indexed => {
+            if has_preview {
+                return Err(PsdError::UnsupportedFeature(
+                    "cannot write Indexed composite from an RGBA preview: \
+                     palette indices cannot be inferred from RGB components"
+                        .to_string(),
+                ));
+            }
+            vec![CompositePlane::Zero]
+        }
+        ColorMode::Bitmap => {
+            return Err(PsdError::UnsupportedFeature(
+                "writing Bitmap composite images is not supported".to_string(),
+            ))
+        }
+        ColorMode::CMYK => {
+            if has_preview {
+                return Err(PsdError::UnsupportedFeature(
+                    "writing CMYK composite from an RGBA preview requires native \
+                     CMYK samples or a managed conversion; refusing to fabricate \
+                     channels"
+                        .to_string(),
+                ));
+            }
+            vec![CompositePlane::Zero; 4]
+        }
+        other => {
+            if has_preview {
+                return Err(PsdError::UnsupportedFeature(format!(
+                    "composite image writing for {:?} documents is not supported",
+                    other
+                )));
+            }
+            // Blank document: emit zero planes so header and payload agree.
+            vec![CompositePlane::Zero; 3]
+        }
+    };
+    if global_alpha {
+        plan.push(CompositePlane::Alpha);
+    }
+    Ok(plan)
+}
+
+/// Write the retained native composite planes.
+fn write_native_composite(
+    writer: &mut PsdWriter,
+    native: &crate::api::psd::CompositeNativeData,
+    width: usize,
+    height: usize,
+    compression: Compression,
+    psb: bool,
+) -> Result<()> {
+    let bytes_per_sample = match native.bits_per_channel {
+        8 => 1usize,
+        16 => 2,
+        32 => 4,
+        other => {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "Unsupported composite bits per channel: {}",
+                other
+            )))
+        }
+    };
+    if native.channels.is_empty() {
+        return Err(PsdError::InvalidFormat(
+            "Native composite has no channel planes".to_string(),
+        ));
+    }
+    let plane_len = width
+        .checked_mul(height)
+        .and_then(|v| v.checked_mul(bytes_per_sample))
+        .ok_or_else(|| PsdError::InvalidFormat("Native composite size overflow".to_string()))?;
+    for (i, plane) in native.channels.iter().enumerate() {
+        if plane.len() != plane_len {
+            return Err(PsdError::InvalidFormat(format!(
+                "Native composite channel {} holds {} bytes; expected {} ({}x{} at {} bits)",
+                i,
+                plane.len(),
+                plane_len,
+                width,
+                height,
+                native.bits_per_channel
+            )));
+        }
+    }
+
+    match compression {
+        Compression::RawData => {
+            for plane in &native.channels {
+                writer.write_bytes(plane)?;
+            }
+        }
+        Compression::RleCompressed => {
+            let row_bytes = width * bytes_per_sample;
+            let mut compressed_channels = Vec::with_capacity(native.channels.len());
+            for plane in &native.channels {
+                compressed_channels.push(compression::compress_rle_rows(plane, row_bytes, height)?);
+            }
+            // All row byte-counts come first, then the row data.
+            for (counts, _) in &compressed_channels {
+                for count in counts {
+                    if psb {
+                        writer.write_u32(*count)?;
+                    } else {
+                        writer.write_u16(u16::try_from(*count).map_err(|_| {
+                            PsdError::UnsupportedFeature(
+                                "RLE row count exceeds the PSD 16-bit limit".to_string(),
+                            )
+                        })?)?;
+                    }
+                }
+            }
+            for (_, rows) in &compressed_channels {
+                writer.write_bytes(rows)?;
+            }
+        }
+        Compression::ZipWithoutPrediction => {
+            let mut planar = Vec::with_capacity(plane_len * native.channels.len());
+            for plane in &native.channels {
+                planar.extend_from_slice(plane);
+            }
+            let compressed = compression::compress_zip(&planar)?;
+            writer.write_bytes(&compressed)?;
+        }
+        Compression::ZipWithPrediction => {
+            let mut planar = Vec::with_capacity(plane_len * native.channels.len());
+            for plane in &native.channels {
+                planar.extend_from_slice(plane);
+            }
+            compression::apply_prediction_planar(
+                &mut planar,
+                width,
+                height,
+                native.channels.len(),
+                native.bits_per_channel,
+            )?;
+            let compressed = compression::compress_zip(&planar)?;
+            writer.write_bytes(&compressed)?;
+        }
+    }
+    Ok(())
+}
+
 /// Write image data section
 fn write_image_data(
     writer: &mut PsdWriter,
@@ -825,40 +1195,99 @@ fn write_image_data(
     let bits_per_channel = psd.bits_per_channel.unwrap_or(8);
     let compression = preferred_channel_compression(bits_per_channel, options);
     let psb = options.psb.unwrap_or(false);
+    let color_mode = psd.color_mode.unwrap_or(ColorMode::RGB);
     writer.write_u16(compression as u16)?;
+
+    // An unchanged save prefers the original native planes over the quantized
+    // RGBA preview: 16/32-bit samples and non-RGB channels survive verbatim.
+    // Any edit to the preview invalidates them.
+    if let Some(ref native) = psd.composite_native {
+        let preview_unchanged = match psd.image_data.as_ref() {
+            Some(image) => image.data == native.preview,
+            None => native.preview.is_empty(),
+        };
+        if preview_unchanged
+            && native.bits_per_channel as u8 == bits_per_channel
+            && native.color_mode == color_mode
+        {
+            return write_native_composite(
+                writer,
+                native,
+                psd.width as usize,
+                psd.height as usize,
+                compression,
+                psb,
+            );
+        }
+    }
 
     let fallback_width = psd.width as usize;
     let fallback_height = psd.height as usize;
-    let fallback_rgba = vec![0u8; fallback_width * fallback_height * 4];
-    let (image_data, width, height) = if let Some(ref image_data) = psd.image_data {
-        (
-            image_data.data.as_slice(),
-            image_data.width,
-            image_data.height,
-        )
-    } else {
-        (fallback_rgba.as_slice(), fallback_width, fallback_height)
+    let preview: Option<&[u8]> = psd.image_data.as_ref().map(|image| image.data.as_slice());
+    let (width, height) = match psd.image_data.as_ref() {
+        Some(image_data) => {
+            // The payload dimensions must agree with the header, and the RGBA
+            // buffer must actually cover the declared pixel area; mismatches
+            // are errors, never silent padding or truncation.
+            if image_data.width != psd.width as usize || image_data.height != psd.height as usize {
+                return Err(PsdError::InvalidFormat(format!(
+                    "Composite pixel data is {}x{} but the document header is {}x{}",
+                    image_data.width, image_data.height, psd.width, psd.height
+                )));
+            }
+            let pixel_len = image_data
+                .width
+                .checked_mul(image_data.height)
+                .ok_or_else(|| {
+                    PsdError::InvalidFormat("Composite dimensions overflow".to_string())
+                })?;
+            if image_data.data.len() < pixel_len * 4 {
+                return Err(PsdError::InvalidFormat(format!(
+                    "Composite pixel buffer has {} bytes but {}x{} RGBA needs {}",
+                    image_data.data.len(),
+                    image_data.width,
+                    image_data.height,
+                    pixel_len * 4
+                )));
+            }
+            (image_data.width, image_data.height)
+        }
+        None => (fallback_width, fallback_height),
     };
 
-    let offsets: &[usize] = if global_alpha {
-        &[0, 1, 2, 3]
-    } else {
-        &[0, 1, 2]
+    let has_preview = psd.image_data.is_some();
+    let plan = composite_plan(color_mode, global_alpha, has_preview)?;
+    let plane_byte_len = width * height;
+    let mut planes: Vec<Vec<u8>> = Vec::with_capacity(plan.len());
+    for plane in &plan {
+        planes.push(match plane {
+            CompositePlane::Red => extract_channel_data_from_rgba_opt(preview, width, height, 0),
+            CompositePlane::Green => extract_channel_data_from_rgba_opt(preview, width, height, 1),
+            CompositePlane::Blue => extract_channel_data_from_rgba_opt(preview, width, height, 2),
+            CompositePlane::Alpha => extract_channel_data_from_rgba_opt(preview, width, height, 3),
+            CompositePlane::Gray => extract_channel_data_from_rgba_opt(preview, width, height, 0),
+            CompositePlane::Zero => vec![0u8; plane_byte_len],
+        });
+    }
+
+    let emit_plane = |writer: &mut PsdWriter, raw: &[u8]| -> Result<()> {
+        writer.write_bytes(&expand_samples_for_depth(raw, bits_per_channel))
     };
+
     match compression {
         Compression::RawData => {
-            for &offset in offsets {
-                let raw = extract_channel_data_from_rgba(image_data, width, height, offset);
-                writer.write_bytes(&expand_samples_for_depth(&raw, bits_per_channel))?;
+            for raw in &planes {
+                emit_plane(writer, raw)?;
             }
         }
         Compression::RleCompressed => {
-            let mut compressed_channels = Vec::with_capacity(offsets.len());
-            for &offset in offsets {
-                let raw = extract_channel_data_from_rgba(image_data, width, height, offset);
-                let expanded = expand_samples_for_depth(&raw, bits_per_channel);
+            let mut compressed_channels = Vec::with_capacity(planes.len());
+            for raw in &planes {
+                let expanded = expand_samples_for_depth(raw, bits_per_channel);
                 let row_bytes = width * bytes_per_sample(bits_per_channel);
-                compressed_channels.push(compression::compress_rle_rows(&expanded, row_bytes, height)?);
+                compressed_channels.push(compression::compress_rle_rows(
+                    &expanded, row_bytes, height,
+                )?);
             }
 
             // PSD composite RLE stores all row byte-counts first, then compressed row data.
@@ -867,7 +1296,11 @@ fn write_image_data(
                     if psb {
                         writer.write_u32(*count)?;
                     } else {
-                        writer.write_u16(*count as u16)?;
+                        writer.write_u16(u16::try_from(*count).map_err(|_| {
+                            PsdError::UnsupportedFeature(
+                                "RLE row count exceeds the PSD 16-bit limit".to_string(),
+                            )
+                        })?)?;
                     }
                 }
             }
@@ -876,31 +1309,25 @@ fn write_image_data(
             }
         }
         Compression::ZipWithoutPrediction => {
-            let mut planar = Vec::with_capacity(
-                width * height * offsets.len() * bytes_per_sample(bits_per_channel),
-            );
-            for &offset in offsets {
-                let raw = extract_channel_data_from_rgba(image_data, width, height, offset);
-                planar.extend_from_slice(&expand_samples_for_depth(&raw, bits_per_channel));
+            let mut planar = Vec::with_capacity(plane_byte_len * planes.len());
+            for raw in &planes {
+                planar.extend_from_slice(&expand_samples_for_depth(raw, bits_per_channel));
             }
             let compressed = compression::compress_zip(&planar)?;
             writer.write_bytes(&compressed)?;
         }
         Compression::ZipWithPrediction => {
-            let mut planar = Vec::with_capacity(
-                width * height * offsets.len() * bytes_per_sample(bits_per_channel),
-            );
-            for &offset in offsets {
-                let raw = extract_channel_data_from_rgba(image_data, width, height, offset);
-                planar.extend_from_slice(&expand_samples_for_depth(&raw, bits_per_channel));
+            let mut planar = Vec::with_capacity(plane_byte_len * planes.len());
+            for raw in &planes {
+                planar.extend_from_slice(&expand_samples_for_depth(raw, bits_per_channel));
             }
-            apply_prediction_planar(
+            compression::apply_prediction_planar(
                 &mut planar,
                 width,
                 height,
-                offsets.len(),
+                planes.len(),
                 bits_per_channel as u16,
-            );
+            )?;
             let compressed = compression::compress_zip(&planar)?;
             writer.write_bytes(&compressed)?;
         }
@@ -966,13 +1393,34 @@ fn layer_channel_payload(
     }
 }
 
+/// Whether a layer's raw channel data is current enough to reuse: the raw
+/// data must exist and its read-time preview must still match the current
+/// `image_data` (or both be absent).
+fn layer_raw_is_current(layer: &Layer) -> bool {
+    match (layer.raw_data.as_ref(), layer.image_data.as_ref()) {
+        (None, _) => false,
+        (Some(raw), None) => raw.preview.is_none(),
+        (Some(raw), Some(image)) => raw.preview.as_ref() == Some(image),
+    }
+}
+
 fn prepare_layer_channels(
     layer: &Layer,
+    color_mode: ColorMode,
     bits_per_channel: u8,
     options: &WriteOptions,
 ) -> Result<PreparedLayerChannels> {
+    let psb = options.psb.unwrap_or(false);
     if let Some(ref raw_data) = layer.raw_data {
-        if raw_data.bits_per_channel == bits_per_channel {
+        if raw_data.color_mode != color_mode {
+            return Err(PsdError::UnsupportedFeature(format!(
+                "Layer raw channel data is {raw:?} but the document is {color_mode:?}; \
+                 refusing to reinterpret color channels",
+                raw = raw_data.color_mode
+            )));
+        }
+        // An edited preview invalidates the raw cache: the caller's edits win.
+        if raw_data.bits_per_channel == bits_per_channel && layer_raw_is_current(layer) {
             let mut entries = Vec::with_capacity(raw_data.channels.len());
             for channel in &raw_data.channels {
                 let (width, height) = layer_channel_dimensions(layer, channel.id);
@@ -982,12 +1430,10 @@ fn prepare_layer_channels(
                     Compression::RawData => raw,
                     Compression::RleCompressed => {
                         let row_bytes = width * bytes_per_sample(bits_per_channel);
-                        compression::compress_rle(
-                            &raw,
-                            row_bytes,
-                            height,
-                            layer.raw_data.as_ref().map(|raw| raw.large).unwrap_or(options.psb.unwrap_or(false)),
-                        )?
+                        // Row-count width must match the destination version;
+                        // the source version (raw_data.large) only applies when
+                        // decoding the preserved source bytes.
+                        compression::compress_rle(&raw, row_bytes, height, psb)?
                     }
                     Compression::ZipWithoutPrediction => compression::compress_zip(&raw)?,
                     Compression::ZipWithPrediction => compression::compress_zip_with_prediction(
@@ -1007,12 +1453,24 @@ fn prepare_layer_channels(
         }
     }
 
-    let mut channel_ids = vec![
-        ChannelID::Transparency,
-        ChannelID::Color0,
-        ChannelID::Color1,
-        ChannelID::Color2,
-    ];
+    let mut channel_ids = match color_mode {
+        ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Indexed => {
+            vec![ChannelID::Transparency, ChannelID::Color0]
+        }
+        ColorMode::CMYK => vec![
+            ChannelID::Transparency,
+            ChannelID::Color0,
+            ChannelID::Color1,
+            ChannelID::Color2,
+            ChannelID::Color3,
+        ],
+        _ => vec![
+            ChannelID::Transparency,
+            ChannelID::Color0,
+            ChannelID::Color1,
+            ChannelID::Color2,
+        ],
+    };
     if layer
         .additional_info
         .mask
@@ -1065,12 +1523,7 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
                 let top = mask.top.unwrap_or(layer_top);
                 let right = mask.right.unwrap_or(left);
                 let bottom = mask.bottom.unwrap_or(top);
-                return (
-                    left,
-                    top,
-                    (right - left).max(0) as usize,
-                    (bottom - top).max(0) as usize,
-                );
+                return (left, top, extent(left, right), extent(top, bottom));
             }
         }
         ChannelID::RealUserMask => {
@@ -1084,12 +1537,7 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
                     let top = mask.top.unwrap_or(layer_top);
                     let right = mask.right.unwrap_or(left);
                     let bottom = mask.bottom.unwrap_or(top);
-                    return (
-                        left,
-                        top,
-                        (right - left).max(0) as usize,
-                        (bottom - top).max(0) as usize,
-                    );
+                    return (left, top, extent(left, right), extent(top, bottom));
                 }
             }
             if let Some(mask) = layer.additional_info.mask.as_ref() {
@@ -1097,12 +1545,7 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
                 let top = mask.real_top.or(mask.top).unwrap_or(layer_top);
                 let right = mask.real_right.or(mask.right).unwrap_or(left);
                 let bottom = mask.real_bottom.or(mask.bottom).unwrap_or(top);
-                return (
-                    left,
-                    top,
-                    (right - left).max(0) as usize,
-                    (bottom - top).max(0) as usize,
-                );
+                return (left, top, extent(left, right), extent(top, bottom));
             }
         }
         _ => {}
@@ -1111,9 +1554,15 @@ fn layer_channel_bounds(layer: &Layer, channel_id: ChannelID) -> (i32, i32, usiz
     (
         layer_left,
         layer_top,
-        (layer_right - layer_left).max(0) as usize,
-        (layer_bottom - layer_top).max(0) as usize,
+        extent(layer_left, layer_right),
+        extent(layer_top, layer_bottom),
     )
+}
+
+fn extent(start: i32, end: i32) -> usize {
+    end.checked_sub(start)
+        .filter(|value| *value >= 0)
+        .unwrap_or(0) as usize
 }
 
 fn preferred_channel_compression(bits_per_channel: u8, options: &WriteOptions) -> Compression {
@@ -1133,68 +1582,6 @@ fn bytes_per_sample(bits_per_channel: u8) -> usize {
         16 => 2,
         32 => 4,
         _ => 1,
-    }
-}
-
-fn apply_prediction_planar(
-    data: &mut [u8],
-    width: usize,
-    height: usize,
-    channels: usize,
-    depth: u16,
-) {
-    let bytes_per_sample = match depth {
-        8 => 1usize,
-        16 => 2,
-        32 => 4,
-        _ => return,
-    };
-    let plane_len = width * height * bytes_per_sample;
-
-    for channel in 0..channels {
-        let plane_start = channel * plane_len;
-        match depth {
-            8 => {
-                for row in 0..height {
-                    let start = plane_start + row * width;
-                    for x in (1..width).rev() {
-                        data[start + x] = data[start + x].wrapping_sub(data[start + x - 1]);
-                    }
-                }
-            }
-            16 => {
-                let row_bytes = width * 2;
-                for row in 0..height {
-                    let start = plane_start + row * row_bytes;
-                    for i in (start + 1..start + row_bytes).rev() {
-                        data[i] = data[i].wrapping_sub(data[i - 1]);
-                    }
-                }
-            }
-            32 => {
-                let row_bytes = width * 4;
-                let mut reordered = vec![0u8; row_bytes];
-                for row in 0..height {
-                    let row_off = plane_start + row * row_bytes;
-                    for pixel in 0..width {
-                        let src = row_off + pixel * 4;
-                        reordered[pixel] = data[src];
-                        reordered[width + pixel] = data[src + 1];
-                        reordered[width * 2 + pixel] = data[src + 2];
-                        reordered[width * 3 + pixel] = data[src + 3];
-                    }
-                    for plane in 0..4usize {
-                        let base = plane * width;
-                        for i in (1..width).rev() {
-                            reordered[base + i] =
-                                reordered[base + i].wrapping_sub(reordered[base + i - 1]);
-                        }
-                    }
-                    data[row_off..row_off + row_bytes].copy_from_slice(&reordered);
-                }
-            }
-            _ => {}
-        }
     }
 }
 
@@ -1256,20 +1643,24 @@ fn extract_mask_channel_data(
     out
 }
 
-fn extract_channel_data_from_rgba(
-    image_data: &[u8],
+fn extract_channel_data_from_rgba_opt(
+    image_data: Option<&[u8]>,
     width: usize,
     height: usize,
     offset: usize,
 ) -> Vec<u8> {
     let mut out = vec![0u8; width * height];
-    for i in 0..(width * height) {
-        let src = i * 4 + offset;
-        if src < image_data.len() {
-            out[i] = image_data[src];
-        } else if offset == 3 {
-            out[i] = 255;
+    if let Some(image_data) = image_data {
+        for i in 0..(width * height) {
+            let src = i * 4 + offset;
+            if src < image_data.len() {
+                out[i] = image_data[src];
+            } else if offset == 3 {
+                out[i] = 255;
+            }
         }
+    } else if offset == 3 {
+        out.fill(255);
     }
     out
 }
@@ -1277,10 +1668,10 @@ fn extract_channel_data_from_rgba(
 fn serialize_layer_blending_ranges(ranges: &crate::api::layer::LayerBlendingRangesData) -> Vec<u8> {
     let mut out = Vec::new();
     let mut write_pair = |pair: &crate::api::layer::LayerBlendingRangePair| {
-        out.push(pair.src_black);
-        out.push(pair.src_white);
-        out.push(pair.dst_black);
-        out.push(pair.dst_white);
+        out.extend_from_slice(&pair.src_black.to_be_bytes());
+        out.extend_from_slice(&pair.src_white.to_be_bytes());
+        out.extend_from_slice(&pair.dst_black.to_be_bytes());
+        out.extend_from_slice(&pair.dst_white.to_be_bytes());
     };
 
     if let Some(ref pair) = ranges.composite_gray {
@@ -1301,7 +1692,11 @@ fn should_emit_default_blending_ranges(
         || channel_payloads.entries.iter().any(|entry| {
             matches!(
                 entry.id,
-                ChannelID::Transparency | ChannelID::Color0 | ChannelID::Color1 | ChannelID::Color2 | ChannelID::Color3
+                ChannelID::Transparency
+                    | ChannelID::Color0
+                    | ChannelID::Color1
+                    | ChannelID::Color2
+                    | ChannelID::Color3
             )
         })
 }
@@ -1313,7 +1708,11 @@ fn default_layer_blending_ranges_bytes(channel_payloads: &PreparedLayerChannels)
         .filter(|entry| {
             matches!(
                 entry.id,
-                ChannelID::Transparency | ChannelID::Color0 | ChannelID::Color1 | ChannelID::Color2 | ChannelID::Color3
+                ChannelID::Transparency
+                    | ChannelID::Color0
+                    | ChannelID::Color1
+                    | ChannelID::Color2
+                    | ChannelID::Color3
             )
         })
         .count();
@@ -1336,27 +1735,91 @@ fn apply_resource_prewrite(psd: &mut Psd) {
     }
 }
 
+/// Clear the cached TySh raw bytes of every text layer (recursively) whose
+/// typed `text` diverges from the displayed text stored in its wire
+/// descriptor (`Txt ` item). Returns whether any layer was edited.
+fn invalidate_edited_text_raws(psd: &mut Psd) -> bool {
+    fn clear_layer(layer: &mut crate::api::layer::Layer) -> bool {
+        let mut edited = false;
+        if let Some(ref mut text) = layer.additional_info.text {
+            if let Some(raw) = text.raw_bytes.as_ref() {
+                if !text_raw_matches(text, raw) {
+                    text.raw_bytes = None;
+                    edited = true;
+                }
+            }
+        }
+        if let Some(children) = layer.children.as_mut() {
+            edited |= children.iter_mut().any(clear_layer);
+        }
+        edited
+    }
+
+    psd.children
+        .as_mut()
+        .map(|children| children.iter_mut().any(clear_layer))
+        .unwrap_or(false)
+}
+
+fn text_raw_matches(text: &crate::format::additional_info::TextLayerData, raw: &[u8]) -> bool {
+    let mut reader =
+        crate::io::reader::PsdReader::new(Cursor::new(raw.to_vec()), Default::default());
+    let mut parsed = crate::format::additional_info::LayerAdditionalInfo::default();
+    if reader.read_text_layer(&mut parsed, raw.len()).is_err() {
+        return false;
+    }
+    let Some(parsed) = parsed.text else {
+        return false;
+    };
+    text.transform == parsed.transform
+        && text.text == parsed.text
+        && text.text_version == parsed.text_version
+        && text.descriptor_version == parsed.descriptor_version
+        && text.text_data == parsed.text_data
+        && text.warp_version == parsed.warp_version
+        && text.warp_descriptor_version == parsed.warp_descriptor_version
+        && text.warp_data == parsed.warp_data
+        && text.left == parsed.left
+        && text.top == parsed.top
+        && text.right == parsed.right
+        && text.bottom == parsed.bottom
+}
+
 /// Apply text prewrite: synthesize Txt2 engine data from TySh layer text data
 fn apply_text_prewrite(psd: &mut Psd) -> Result<()> {
     use crate::support::engine_data::EngineValue;
     use std::collections::HashMap;
 
+    // If a document engine exists, keep it (and its raw bytes) verbatim -
+    // but only while no typed text edit diverges from the stored wire text.
+    // A changed text forces reconciliation: the affected layer's TySh cache
+    // is dropped (so the synced descriptor is written) and the stale
+    // document engine is regenerated from the current layer tree.
+    let edited_any = invalidate_edited_text_raws(psd);
     if psd.additional_info.text_engine.is_some() {
-        return Ok(());
+        if !edited_any {
+            return Ok(());
+        }
+        psd.additional_info.text_engine = None;
     }
 
     let mut text_objects = Vec::new();
     let mut document_resources: Option<EngineValue> = None;
 
-    if let Some(ref mut layers) = psd.children {
+    fn collect_text(
+        layers: &mut [crate::api::layer::Layer],
+        text_objects: &mut Vec<EngineValue>,
+        document_resources: &mut Option<EngineValue>,
+    ) {
         for layer in layers.iter_mut() {
             if let Some(ref mut text) = layer.additional_info.text {
                 let mut style_run_array = Vec::new();
                 let mut paragraph_run_array = Vec::new();
 
                 if let Some(ref text_desc) = text.text_data {
-                    if let Some(crate::support::descriptor::DescriptorValue::DataBytes(engine_bytes)) =
-                        text_desc.items.get("EngineData")
+                    if let Some(crate::support::descriptor::DescriptorValue::DataBytes(
+                        engine_bytes,
+                    )) = text_desc.items.get("EngineData")
                     {
                         if let Ok(EngineValue::Object(engine_map)) =
                             crate::support::engine_data::parse_engine_data(engine_bytes)
@@ -1390,7 +1853,7 @@ fn apply_text_prewrite(psd: &mut Psd) -> Result<()> {
                                     .cloned()
                                     .or_else(|| engine_map.get("ResourceDict").cloned())
                                 {
-                                    document_resources = Some(value);
+                                    *document_resources = Some(value);
                                 }
                             }
                         }
@@ -1418,7 +1881,14 @@ fn apply_text_prewrite(psd: &mut Psd) -> Result<()> {
                 text_obj.insert("_Model".to_string(), EngineValue::Object(model));
                 text_objects.push(EngineValue::Object(text_obj));
             }
+            if let Some(children) = layer.children.as_mut() {
+                collect_text(children, text_objects, document_resources);
+            }
         }
+    }
+
+    if let Some(ref mut layers) = psd.children {
+        collect_text(layers, &mut text_objects, &mut document_resources);
     }
 
     if !text_objects.is_empty() {
@@ -1458,7 +1928,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn roundtrip_sample_path() -> PathBuf {
-        PathBuf::from("/Users/jakubkolcar/Downloads/3D-preview-sample/3d-preview-mockup.psd")
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/samples/3d-preview-mockup.psd")
     }
 
     fn find_layer_by_name_with_user_mask<'a>(layers: &'a [Layer], name: &str) -> Option<&'a Layer> {
@@ -1580,7 +2051,7 @@ mod tests {
         )
         .expect("write psd");
 
-        assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), 3);
+        assert_eq!(u16::from_be_bytes([bytes[12], bytes[13]]), 4);
 
         let reparsed = crate::read_psd(
             Cursor::new(bytes),
@@ -1590,7 +2061,7 @@ mod tests {
             },
         )
         .expect("reparse written psd");
-        assert_eq!(reparsed.channels, Some(3));
+        assert_eq!(reparsed.channels, Some(4));
     }
 
     #[test]
@@ -1706,6 +2177,7 @@ mod tests {
 
         let prepared = prepare_layer_channels(
             &layer,
+            ColorMode::RGB,
             8,
             &WriteOptions {
                 compress: Some(false),
@@ -1778,14 +2250,12 @@ mod tests {
         let original = fs::read(roundtrip_sample_path()).expect("read roundtrip sample");
         let psd = crate::read_psd(Cursor::new(original), ReadOptions::default())
             .expect("parse original sample for synthesized write");
-        let layer = find_layer_by_name_with_user_mask(
-            psd.children.as_deref().unwrap_or(&[]),
-            "4",
-        )
-        .expect("sample layer with user mask");
+        let layer = find_layer_by_name_with_user_mask(psd.children.as_deref().unwrap_or(&[]), "4")
+            .expect("sample layer with user mask");
 
         let prepared = prepare_layer_channels(
             layer,
+            psd.color_mode.unwrap_or(ColorMode::RGB),
             psd.bits_per_channel.unwrap_or(8),
             &WriteOptions::default(),
         )
@@ -1798,4 +2268,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn editing_nested_text_in_loaded_document_reconciles_with_engine() {
+        let original =
+            fs::read("tests/fixtures/samples/multi-value-items.psd").expect("read text fixture");
+        let mut psd = crate::read_psd(Cursor::new(original), ReadOptions::default())
+            .expect("parse text fixture");
+
+        fn count_texts(layers: &[Layer]) -> usize {
+            layers.iter().fold(0, |acc, layer| {
+                acc + usize::from(layer.additional_info.text.is_some())
+                    + layer
+                        .children
+                        .as_deref()
+                        .map(|children| count_texts(children))
+                        .unwrap_or(0)
+            })
+        }
+
+        fn find_deep_text_mut<'a>(
+            layers: &'a mut [Layer],
+            depth: usize,
+            name: &str,
+        ) -> Option<&'a mut Layer> {
+            for layer in layers.iter_mut() {
+                if depth > 0
+                    && layer.additional_info.name.as_deref() == Some(name)
+                    && layer.additional_info.text.is_some()
+                {
+                    return Some(layer);
+                }
+                if let Some(children) = layer.children.as_mut() {
+                    if let Some(found) = find_deep_text_mut(children, depth + 1, name) {
+                        return Some(found);
+                    }
+                }
+            }
+            None
+        }
+
+        fn find_text(layers: &[Layer], content: &str) -> bool {
+            layers.iter().any(|layer| {
+                (layer.additional_info.text.as_ref().map(|t| t.text.as_str()) == Some(content))
+                    || layer
+                        .children
+                        .as_deref()
+                        .map(|children| find_text(children, content))
+                        .unwrap_or(false)
+            })
+        }
+
+        let text_count_before = count_texts(psd.children.as_ref().expect("children"));
+        assert!(
+            text_count_before >= 4,
+            "fixture should carry several text layers"
+        );
+
+        // Edit a text layer nested inside a group. No manual invalidation is
+        // required: the prewrite detects the divergence and reconciles.
+        let nested = find_deep_text_mut(
+            psd.children.as_mut().expect("children"),
+            0,
+            "The third text item",
+        )
+        .expect("nested text layer");
+        nested.additional_info.text.as_mut().unwrap().text = "edited-third-item".to_string();
+
+        let bytes =
+            crate::write_psd(&psd, &crate::api::psd::WriteOptions::default()).expect("write");
+        let phrase_utf16be: Vec<u8> = "edited-third-item"
+            .encode_utf16()
+            .flat_map(|unit| unit.to_be_bytes())
+            .collect();
+        assert!(
+            bytes
+                .windows(phrase_utf16be.len())
+                .any(|w| w == phrase_utf16be.as_slice()),
+            "edited text missing from raw wire output"
+        );
+        let reparsed = crate::read_psd(Cursor::new(bytes), ReadOptions::default())
+            .expect("reparse edited document");
+        let children = reparsed.children.as_ref().expect("children");
+
+        // The nested edit survived and is visible at the same nesting level.
+        assert!(
+            find_text(children, "edited-third-item"),
+            "nested edit must persist"
+        );
+        assert_eq!(
+            count_texts(children),
+            text_count_before,
+            "text object count unchanged"
+        );
+
+        // Every unedited text layer kept its exact original content.
+        fn text_by_name<'a>(
+            layers: &'a [Layer],
+            out: &mut std::collections::HashMap<String, String>,
+        ) {
+            for layer in layers {
+                if let (Some(name), Some(text)) = (
+                    layer.additional_info.name.as_ref(),
+                    layer.additional_info.text.as_ref(),
+                ) {
+                    out.entry(name.clone()).or_insert_with(|| text.text.clone());
+                }
+                if let Some(children) = layer.children.as_ref() {
+                    text_by_name(children, out);
+                }
+            }
+        }
+        let mut before: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        text_by_name(psd.children.as_ref().expect("children"), &mut before);
+        let mut after: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        text_by_name(children, &mut after);
+        for (name, original_text) in &before {
+            if name == "The third text item" {
+                continue;
+            }
+            assert_eq!(
+                after.get(name),
+                Some(original_text),
+                "unedited text layer {:?} changed",
+                name
+            );
+        }
+        assert_eq!(
+            after.get("The third text item"),
+            Some(&"edited-third-item".to_string())
+        );
+
+        // The document engine was regenerated instead of silently dropped.
+        let engine = reparsed
+            .additional_info
+            .text_engine
+            .as_ref()
+            .expect("document engine regenerated");
+        assert!(engine.raw.is_some(), "engine serialized");
+    }
 }

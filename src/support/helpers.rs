@@ -2,9 +2,9 @@
 //!
 //! Includes blend mode conversion, color space utilities, and image data handling.
 
+use crate::api::types::{BlendMode, ChannelID, PixelData};
 use crate::support::compression;
 use crate::support::error::{PsdError, Result};
-use crate::api::types::{BlendMode, ChannelID, PixelData};
 use bitflags::bitflags;
 use std::collections::HashMap;
 
@@ -161,6 +161,7 @@ pub fn offset_for_channel(channel_id: ChannelID, cmyk: bool) -> usize {
         }
         ChannelID::UserMask => 0,
         ChannelID::RealUserMask => 0,
+        ChannelID::Other(_) => 0,
     }
 }
 

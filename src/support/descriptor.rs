@@ -3,9 +3,9 @@
 //! Handles Adobe Photoshop descriptor structures used throughout PSD files.
 //! Descriptors are key-value data structures with typed values.
 
-use crate::support::error::{PsdError, Result};
 use crate::io::reader::PsdReader;
 use crate::io::writer::PsdWriter;
+use crate::support::error::{PsdError, Result};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
@@ -51,6 +51,43 @@ pub enum DescriptorValue {
     ObjectArray {
         class_id: String,
         items: Vec<ObjectArrayItem>,
+    },
+    /// Reference item: property (`prop`) carries name/class/key.
+    PropertyReference {
+        name: String,
+        class_id: String,
+        key: String,
+    },
+    /// Reference item: relative offset (`rele`).
+    Offset {
+        name: String,
+        class_id: String,
+        offset: i32,
+    },
+    /// Reference item: enumerated reference (`Enmr`).
+    EnumeratedReference {
+        name: String,
+        class_id: String,
+        type_id: String,
+        value: String,
+    },
+    /// Reference item: identifier (`Idnt`).
+    Identifier {
+        name: String,
+        class_id: String,
+        id: u32,
+    },
+    /// Reference item: index (`indx`).
+    Index {
+        name: String,
+        class_id: String,
+        index: u32,
+    },
+    /// Reference item: name (`name`).
+    NamedValue {
+        name: String,
+        class_id: String,
+        value: String,
     },
 }
 
@@ -209,14 +246,26 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read descriptor structure
     pub fn read_descriptor_structure(&mut self) -> Result<Descriptor> {
+        self.read_descriptor_structure_depth(0)
+    }
+
+    /// Read descriptor structure at an explicit nesting depth, so crafted
+    /// deeply nested descriptors cannot exhaust the stack.
+    fn read_descriptor_structure_depth(&mut self, depth: u32) -> Result<Descriptor> {
+        if depth > 64 {
+            return Err(PsdError::InvalidFormat(format!(
+                "Descriptor nesting exceeds depth limit of 64"
+            )));
+        }
         let (name, class_id) = self.read_class_structure()?;
         let item_count = self.read_u32()?;
+        crate::support::limits::check_container_count(item_count as u64, "descriptor item count")?;
 
         let mut items = HashMap::new();
         for _ in 0..item_count {
             let key = self.read_ascii_string_or_class_id()?;
             let ostype = self.read_signature()?;
-            let value = self.read_ostype(&ostype)?;
+            let value = self.read_ostype_depth(&ostype, depth + 1)?;
             items.insert(key, value);
         }
 
@@ -229,23 +278,43 @@ impl<R: Read + Seek> PsdReader<R> {
 
     /// Read OSType value based on type signature
     pub fn read_ostype(&mut self, ostype: &str) -> Result<DescriptorValue> {
+        self.read_ostype_depth(ostype, 0)
+    }
+
+    /// Read an OSType value at an explicit nesting depth, so crafted deeply
+    /// nested descriptors cannot exhaust the stack.
+    fn read_ostype_depth(&mut self, ostype: &str, depth: u32) -> Result<DescriptorValue> {
+        if depth > 64 {
+            return Err(PsdError::InvalidFormat(
+                "Descriptor nesting exceeds depth limit of 64".to_string(),
+            ));
+        }
         match ostype {
-            // obj  and VlLs share the same on-disk format: count + typed items
-            "obj " | "VlLs" => {
+            // `VlLs` is a list of typed values; `obj ` is a reference list
+            // whose entries use reference item types and carry all fields
+            // (offsets, identifiers, names, ...).
+            "obj " => Ok(DescriptorValue::Reference(self.read_reference_structure()?)),
+            "VlLs" => {
                 let count = self.read_u32()? as usize;
-                let mut items = Vec::with_capacity(count);
+                crate::support::limits::check_container_count(
+                    count as u64,
+                    "descriptor list count",
+                )?;
+                // Capacity grows with data actually read; a hostile count must
+                // not preallocate before its bytes exist.
+                let mut items = Vec::new();
                 for _ in 0..count {
                     let item_type = self.read_signature()?;
-                    items.push(self.read_ostype(&item_type)?);
+                    items.push(self.read_ostype_depth(&item_type, depth + 1)?);
                 }
                 Ok(DescriptorValue::List(items))
             }
             "Objc" => {
-                let desc = self.read_descriptor_structure()?;
+                let desc = self.read_descriptor_structure_depth(depth + 1)?;
                 Ok(DescriptorValue::Descriptor(desc))
             }
             "GlbO" => {
-                let desc = self.read_descriptor_structure()?;
+                let desc = self.read_descriptor_structure_depth(depth + 1)?;
                 Ok(DescriptorValue::GlobalObject(desc))
             }
             "doub" => Ok(DescriptorValue::Double(self.read_f64()?)),
@@ -288,13 +357,17 @@ impl<R: Read + Seek> PsdReader<R> {
                 let _ = self.read_u32()?; // skip
                 let (_name, class_id) = self.read_class_structure()?;
                 let item_count = self.read_u32()? as usize;
-                let mut items = Vec::with_capacity(item_count);
+                crate::support::limits::check_container_count(
+                    item_count as u64,
+                    "object-array item count",
+                )?;
+                let mut items = Vec::new();
                 for _ in 0..item_count {
                     let id = self.read_ascii_string_or_class_id()?;
                     let item_type = self.read_signature()?;
                     let u_id = self.read_signature()?;
                     let len = self.read_u32()? as usize;
-                    let mut values = Vec::with_capacity(len);
+                    let mut values = Vec::new();
                     for _ in 0..len {
                         values.push(self.read_f64()?);
                     }
@@ -314,37 +387,55 @@ impl<R: Read + Seek> PsdReader<R> {
             }
             "rele" => {
                 let (name, class_id) = self.read_class_structure()?;
-                let _offset = self.read_i32()?; // offset value, no separate field
-                Ok(DescriptorValue::Class { name, class_id })
+                let offset = self.read_i32()?;
+                Ok(DescriptorValue::Offset {
+                    name,
+                    class_id,
+                    offset,
+                })
             }
             "prop" => {
-                let (_name, _class_id) = self.read_class_structure()?;
-                let key_id = self.read_ascii_string_or_class_id()?;
-                Ok(DescriptorValue::Property(key_id))
+                let (name, class_id) = self.read_class_structure()?;
+                let key = self.read_ascii_string_or_class_id()?;
+                Ok(DescriptorValue::PropertyReference {
+                    name,
+                    class_id,
+                    key,
+                })
             }
             "Enmr" => {
-                let (_name, _class_id) = self.read_class_structure()?;
+                let (name, class_id) = self.read_class_structure()?;
                 let type_id = self.read_ascii_string_or_class_id()?;
-                let enum_id = self.read_ascii_string_or_class_id()?;
-                Ok(DescriptorValue::Enum {
-                    enum_type: type_id,
-                    value: enum_id,
+                let value = self.read_ascii_string_or_class_id()?;
+                Ok(DescriptorValue::EnumeratedReference {
+                    name,
+                    class_id,
+                    type_id,
+                    value,
                 })
             }
             "indx" => {
-                let (_name, _class_id) = self.read_class_structure()?;
+                let (name, class_id) = self.read_class_structure()?;
                 let index = self.read_u32()?;
-                Ok(DescriptorValue::Integer(index as i32))
+                Ok(DescriptorValue::Index {
+                    name,
+                    class_id,
+                    index,
+                })
             }
             "Idnt" => {
-                let (_name, _class_id) = self.read_class_structure()?;
+                let (name, class_id) = self.read_class_structure()?;
                 let id = self.read_u32()?;
-                Ok(DescriptorValue::Integer(id as i32))
+                Ok(DescriptorValue::Identifier { name, class_id, id })
             }
             "name" => {
-                let (_name, _class_id) = self.read_class_structure()?;
+                let (name, class_id) = self.read_class_structure()?;
                 let value = self.read_unicode_string()?;
-                Ok(DescriptorValue::Text(value))
+                Ok(DescriptorValue::NamedValue {
+                    name,
+                    class_id,
+                    value,
+                })
             }
             "alis" => {
                 let length = self.read_u32()? as usize;
@@ -364,13 +455,13 @@ impl<R: Read + Seek> PsdReader<R> {
                     });
                 }
                 let byte_len = total_length - 8; // bytes after sig+pad
-                let char_count = byte_len / 2 - 1; // subtract null terminator
-                let mut path = String::new();
-                for _ in 0..char_count {
-                    let ch = self.read_u16()?;
-                    path.push(char::from_u32(ch as u32).unwrap_or('\u{FFFD}'));
+                let unit_count = byte_len / 2 - 1; // subtract null terminator
+                let mut units: Vec<u16> = Vec::new();
+                for _ in 0..unit_count {
+                    units.push(self.read_u16()?);
                 }
                 let _null = self.read_u16()?;
+                let path = String::from_utf16_lossy(&units);
                 Ok(DescriptorValue::FilePath { sig, path })
             }
             _ => Err(PsdError::UnsupportedFeature(format!(
@@ -383,7 +474,7 @@ impl<R: Read + Seek> PsdReader<R> {
     /// Read reference structure (kept for compat; `obj ` now uses read_ostype instead)
     pub fn read_reference_structure(&mut self) -> Result<Vec<ReferenceItem>> {
         let item_count = self.read_u32()? as usize;
-        let mut items = Vec::with_capacity(item_count);
+        let mut items = Vec::new();
         for _ in 0..item_count {
             let ostype = self.read_signature()?;
             let item = match ostype.as_str() {
@@ -466,18 +557,21 @@ impl PsdWriter {
     /// Write ASCII string or class ID
     pub fn write_ascii_string_or_class_id(&mut self, value: &str) -> Result<()> {
         if value.len() == 4 && !is_long_descriptor_id(value) {
+            // Four-byte IDs are written as an implicit length prefix (0) plus
+            // the four characters.
             self.write_u32(0)?;
             self.write_signature(value)?;
-        } else if value.len() < 4 && !is_long_descriptor_id(value) {
-            // Short IDs: zero-length prefix + pad to 4 bytes with spaces
-            self.write_u32(0)?;
-            let mut padded = value.to_string();
-            while padded.len() < 4 {
-                padded.push(' ');
-            }
-            self.write_signature(&padded)?;
         } else {
-            self.write_u32(value.len() as u32)?;
+            // Anything else (shorter IDs, IDs on the long allowlist, longer
+            // strings) is written as an actual length-prefixed string; short
+            // IDs must not be padded with spaces onto a pseudo-signature.
+            let len = u32::try_from(value.len()).map_err(|_| {
+                PsdError::UnsupportedFeature(format!(
+                    "ID '{}' is too long for the descriptor string field",
+                    value
+                ))
+            })?;
+            self.write_u32(len)?;
             self.write_bytes(value.as_bytes())?;
         }
         Ok(())
@@ -523,8 +617,9 @@ impl PsdWriter {
             DescriptorValue::Boolean(v) => self.write_u8(if *v { 1 } else { 0 })?,
             DescriptorValue::Text(s) => self.write_unicode_string_with_padding(s)?,
             DescriptorValue::Enum { enum_type, value } => {
-                // Write as "Enmr" format: class_structure(name, class_id) + type_id + value
-                self.write_class_structure("", enum_type)?;
+                // Ordinary descriptor enums are the `enum` wire type with a
+                // type ID and value ID; `Enmr` (class structure + IDs) is
+                // reserved for reference items.
                 self.write_ascii_string_or_class_id(enum_type)?;
                 self.write_ascii_string_or_class_id(value)?;
             }
@@ -550,12 +645,12 @@ impl PsdWriter {
                 self.write_bytes(data)?;
             }
             DescriptorValue::UnitFloat { units, value } => {
-                let code = units_code(units).unwrap_or("#Pxl");
+                let code = write_unit_code(units)?;
                 self.write_signature(code)?;
                 self.write_f32(*value as f32)?;
             }
             DescriptorValue::UnitDouble { units, value } => {
-                let code = units_code(units).unwrap_or("#Pxl");
+                let code = write_unit_code(units)?;
                 self.write_signature(code)?;
                 self.write_f64(*value)?;
             }
@@ -563,6 +658,52 @@ impl PsdWriter {
                 // Write as prop: empty name+classID + key
                 self.write_class_structure("", "")?;
                 self.write_ascii_string_or_class_id(key)?;
+            }
+            DescriptorValue::PropertyReference {
+                name,
+                class_id,
+                key,
+            } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_ascii_string_or_class_id(key)?;
+            }
+            DescriptorValue::Offset {
+                name,
+                class_id,
+                offset,
+            } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_i32(*offset)?;
+            }
+            DescriptorValue::EnumeratedReference {
+                name,
+                class_id,
+                type_id,
+                value,
+            } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_ascii_string_or_class_id(type_id)?;
+                self.write_ascii_string_or_class_id(value)?;
+            }
+            DescriptorValue::Identifier { name, class_id, id } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_u32(*id)?;
+            }
+            DescriptorValue::Index {
+                name,
+                class_id,
+                index,
+            } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_u32(*index)?;
+            }
+            DescriptorValue::NamedValue {
+                name,
+                class_id,
+                value,
+            } => {
+                self.write_class_structure(name, class_id)?;
+                self.write_unicode_string_with_padding(value)?;
             }
             DescriptorValue::Alias(bytes) => {
                 self.write_u32(bytes.len() as u32)?;
@@ -572,13 +713,17 @@ impl PsdWriter {
                 self.write_descriptor_structure(desc)?;
             }
             DescriptorValue::FilePath { sig, path } => {
-                // total_length = 4 (sig) + 4 (pad) + chars*2 + 2 (null)
-                let byte_len = path.chars().count() * 2 + 2 + 8;
-                self.write_u32(byte_len as u32)?;
+                // total_length = 4 (sig) + 4 (pad) + units*2 + 2 (null)
+                let units: Vec<u16> = path.encode_utf16().collect();
+                let byte_len = units.len() * 2 + 2 + 8;
+                let byte_len = u32::try_from(byte_len).map_err(|_| {
+                    PsdError::UnsupportedFeature("FilePath length exceeds the wire u32".to_string())
+                })?;
+                self.write_u32(byte_len)?;
                 self.write_signature(sig)?;
                 self.write_u32(0)?; // pad
-                for ch in path.chars() {
-                    self.write_u16(ch as u16)?;
+                for unit in units {
+                    self.write_u16(unit)?;
                 }
                 self.write_u16(0)?; // null terminator
             }
@@ -674,8 +819,23 @@ impl PsdWriter {
     }
 }
 
+/// Map a unit name to its four-byte wire code, preserving unknown codes that
+/// already are four bytes and rejecting anything that cannot be represented.
+fn write_unit_code(units: &str) -> Result<&str> {
+    if let Some(code) = units_code(units) {
+        return Ok(code);
+    }
+    if units.len() == 4 {
+        return Ok(units);
+    }
+    Err(PsdError::UnsupportedFeature(format!(
+        "Unknown unit '{}' cannot be encoded as a four-byte unit code",
+        units
+    )))
+}
+
 /// Return the ostype signature string for a DescriptorValue
-fn ostype_sig(value: &DescriptorValue) -> &'static str {
+pub(crate) fn ostype_sig(value: &DescriptorValue) -> &'static str {
     match value {
         DescriptorValue::Double(_) => "doub",
         DescriptorValue::Float(_) => "DBL ",
@@ -683,7 +843,7 @@ fn ostype_sig(value: &DescriptorValue) -> &'static str {
         DescriptorValue::LargeInteger { .. } => "comp",
         DescriptorValue::Boolean(_) => "bool",
         DescriptorValue::Text(_) => "TEXT",
-        DescriptorValue::Enum { .. } => "Enmr",
+        DescriptorValue::Enum { .. } => "enum",
         DescriptorValue::Class { .. } => "type",
         DescriptorValue::Reference(_) => "obj ",
         DescriptorValue::Descriptor(_) => "Objc",
@@ -696,6 +856,12 @@ fn ostype_sig(value: &DescriptorValue) -> &'static str {
         DescriptorValue::Alias(_) => "alis",
         DescriptorValue::FilePath { .. } => "Pth ",
         DescriptorValue::ObjectArray { .. } => "ObAr",
+        DescriptorValue::PropertyReference { .. } => "prop",
+        DescriptorValue::Offset { .. } => "rele",
+        DescriptorValue::EnumeratedReference { .. } => "Enmr",
+        DescriptorValue::Identifier { .. } => "Idnt",
+        DescriptorValue::Index { .. } => "indx",
+        DescriptorValue::NamedValue { .. } => "name",
     }
 }
 
@@ -795,33 +961,227 @@ mod tests {
     }
 
     #[test]
-    fn obj_list_roundtrip() {
+    fn vl_ls_list_roundtrip() {
         let list = DescriptorValue::List(vec![
             DescriptorValue::Integer(1),
             DescriptorValue::Integer(2),
         ]);
 
         let mut writer = PsdWriter::new(256);
-        writer.write_signature("obj ").unwrap();
-        writer
-            .write_ostype(&DescriptorValue::List(vec![
-                DescriptorValue::Integer(1),
-                DescriptorValue::Integer(2),
-            ]))
-            .unwrap();
+        writer.write_signature("VlLs").unwrap();
+        writer.write_ostype(&list).unwrap();
 
         let buf = writer.into_buffer();
         let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
         let _ = reader.read_signature().unwrap();
-        // obj  and VlLs share the same wire format
-        match reader.read_ostype("obj ").unwrap() {
+        match reader.read_ostype("VlLs").unwrap() {
             DescriptorValue::List(items) => {
                 assert_eq!(items.len(), 2);
                 assert_eq!(items[0], DescriptorValue::Integer(1));
             }
             _ => panic!("expected List"),
         }
-        let _ = list; // suppress unused warning
+    }
+
+    #[test]
+    fn obj_reference_keeps_offset_and_subtype() {
+        // A reference item of type `rele` carries an offset that must survive
+        // a roundtrip rather than being dropped.
+        let reference = DescriptorValue::Reference(vec![ReferenceItem::Offset {
+            name: "x".to_string(),
+            class_id: "Lyr ".to_string(),
+            offset: 42,
+        }]);
+
+        let mut writer = PsdWriter::new(256);
+        writer.write_signature("obj ").unwrap();
+        writer.write_ostype(&reference).unwrap();
+
+        let buf = writer.into_buffer();
+        let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+        let _ = reader.read_signature().unwrap();
+        match reader.read_ostype("obj ").unwrap() {
+            DescriptorValue::Reference(items) => {
+                assert_eq!(
+                    items,
+                    vec![ReferenceItem::Offset {
+                        name: "x".to_string(),
+                        class_id: "Lyr ".to_string(),
+                        offset: 42,
+                    }]
+                );
+            }
+            _ => panic!("expected Reference"),
+        }
+    }
+
+    #[test]
+    fn deeply_nested_descriptor_hits_depth_limit() {
+        // A crafted descriptor nesting 'Objc' inside 'Objc' beyond the depth
+        // limit must return a structured error instead of exhausting the stack.
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"Objc");
+        for _ in 0..70 {
+            // class structure: empty unicode name, 4-char class id
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(b"Clss");
+            // one item: empty key, ostype 'Objc'
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            bytes.extend_from_slice(b"key ");
+            bytes.extend_from_slice(b"Objc");
+        }
+        let mut reader = PsdReader::new(Cursor::new(bytes), Default::default());
+        let _ = reader.read_signature().unwrap();
+        let err = reader.read_ostype("Objc").unwrap_err();
+        assert!(
+            err.to_string().contains("depth limit"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn enum_writes_enum_signature_with_type_and_value_ids() {
+        let value = DescriptorValue::Enum {
+            enum_type: "Blnd".to_string(),
+            value: "Nrml".to_string(),
+        };
+        let mut writer = PsdWriter::new(64);
+        writer.write_signature("enum").unwrap();
+        writer.write_ostype(&value).unwrap();
+        let buf = writer.into_buffer();
+        // bytes: [enum sig][u32 len prefix 0? for 4-char ids => 00 00 00 00]
+        assert_eq!(&buf[0..4], b"enum");
+        // No extra class structure must follow the type ID.
+        let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+        let _ = reader.read_signature().unwrap();
+        match reader.read_ostype("enum").unwrap() {
+            DescriptorValue::Enum { enum_type, value } => {
+                assert_eq!(enum_type, "Blnd");
+                assert_eq!(value, "Nrml");
+            }
+            _ => panic!("expected Enum"),
+        }
+    }
+
+    #[test]
+    fn file_path_astral_roundtrip() {
+        let value = DescriptorValue::FilePath {
+            sig: "txtu".to_string(),
+            path: "a😀z".to_string(),
+        };
+        let mut writer = PsdWriter::new(256);
+        writer.write_signature("Pth ").unwrap();
+        writer.write_ostype(&value).unwrap();
+        let buf = writer.into_buffer();
+        let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+        let _ = reader.read_signature().unwrap();
+        match reader.read_ostype("Pth ").unwrap() {
+            DescriptorValue::FilePath { sig, path } => {
+                assert_eq!(sig, "txtu");
+                assert_eq!(path, "a😀z");
+            }
+            _ => panic!("expected FilePath"),
+        }
+    }
+
+    #[test]
+    fn unknown_unit_code_is_preserved() {
+        let value = DescriptorValue::UnitDouble {
+            units: "#XYZ".to_string(),
+            value: 2.0,
+        };
+        let mut writer = PsdWriter::new(64);
+        writer.write_signature("UntF").unwrap();
+        writer.write_ostype(&value).unwrap();
+        let buf = writer.into_buffer();
+        let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+        let _ = reader.read_signature().unwrap();
+        match reader.read_ostype("UntF").unwrap() {
+            DescriptorValue::UnitDouble { units, value } => {
+                assert_eq!(units, "#XYZ");
+                assert_eq!(value, 2.0);
+            }
+            _ => panic!("expected UnitDouble"),
+        }
+    }
+
+    #[test]
+    fn short_ids_are_length_prefixed_not_padded() {
+        let mut writer = PsdWriter::new(64);
+        writer.write_ascii_string_or_class_id("abc").unwrap();
+        let buf = writer.into_buffer();
+        assert_eq!(&buf[0..4], &3u32.to_be_bytes());
+        assert_eq!(&buf[4..7], b"abc");
+    }
+
+    #[test]
+    fn standalone_reference_element_values_keep_wire_identity() {
+        let cases: Vec<(String, DescriptorValue)> = vec![
+            (
+                "rele".to_string(),
+                DescriptorValue::Offset {
+                    name: "ref".to_string(),
+                    class_id: "Lyr ".to_string(),
+                    offset: 42,
+                },
+            ),
+            (
+                "Enmr".to_string(),
+                DescriptorValue::EnumeratedReference {
+                    name: "enum".to_string(),
+                    class_id: "Blnd".to_string(),
+                    type_id: "BlnM".to_string(),
+                    value: "Nrml".to_string(),
+                },
+            ),
+            (
+                "Idnt".to_string(),
+                DescriptorValue::Identifier {
+                    name: "id".to_string(),
+                    class_id: "Layr".to_string(),
+                    id: 7,
+                },
+            ),
+            (
+                "indx".to_string(),
+                DescriptorValue::Index {
+                    name: "ix".to_string(),
+                    class_id: "Layr".to_string(),
+                    index: 3,
+                },
+            ),
+            (
+                "name".to_string(),
+                DescriptorValue::NamedValue {
+                    name: "nm".to_string(),
+                    class_id: "Layr".to_string(),
+                    value: "myLayer".to_string(),
+                },
+            ),
+            (
+                "prop".to_string(),
+                DescriptorValue::PropertyReference {
+                    name: "pr".to_string(),
+                    class_id: "prop".to_string(),
+                    key: "key1".to_string(),
+                },
+            ),
+        ];
+        for (sig, value) in cases {
+            let mut writer = PsdWriter::new(256);
+            writer.write_signature(&sig).unwrap();
+            writer.write_ostype(&value).unwrap();
+            let buf = writer.into_buffer();
+            // The serialized element starts with the same type signature.
+            assert_eq!(&buf[0..4], sig.as_bytes(), "signature changed for {sig}");
+            let mut reader = PsdReader::new(Cursor::new(buf), Default::default());
+            let _ = reader.read_signature().unwrap();
+            let read_back = reader.read_ostype(&sig).unwrap();
+            assert_eq!(read_back, value, "fields changed for {sig}");
+        }
     }
 
     #[test]

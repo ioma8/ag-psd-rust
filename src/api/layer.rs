@@ -676,6 +676,11 @@ pub struct LayerRawData {
     pub bits_per_channel: u8,
     pub channels: Vec<LayerRawDataChannel>,
     pub large: bool,
+    /// The layer RGBA preview as of the read that produced this raw data.
+    /// Raw channels are only reused on write while the preview still matches,
+    /// so edits to `Layer::image_data` take precedence instead of being
+    /// silently ignored.
+    pub preview: Option<PixelData>,
 }
 
 /// Vector origination
@@ -693,6 +698,10 @@ pub struct Layer {
     pub right: Option<i32>,
     pub blend_mode: Option<BlendMode>,
     pub opacity: Option<f64>,
+    /// Original layer blend-record flag byte as read from the wire. Kept so
+    /// unmodeled/pixel-data-irrelevant bits survive an unchanged save; typed
+    /// accessors below take precedence when explicitly set.
+    pub raw_blend_flags: Option<u8>,
     pub transparency_protected: Option<bool>,
     pub effects_open: Option<bool>,
     pub hidden: Option<bool>,
@@ -710,10 +719,10 @@ pub struct Layer {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct LayerBlendingRangePair {
-    pub src_black: u8,
-    pub src_white: u8,
-    pub dst_black: u8,
-    pub dst_white: u8,
+    pub src_black: u16,
+    pub src_white: u16,
+    pub dst_black: u16,
+    pub dst_white: u16,
 }
 
 #[derive(Debug, Clone, PartialEq)]

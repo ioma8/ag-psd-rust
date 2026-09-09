@@ -339,12 +339,11 @@ impl<'a> Cursor<'a> {
 
     fn read_unicode_string(&mut self) -> Result<String> {
         let len = self.read_u32()? as usize;
-        let mut s = String::new();
+        let mut units: Vec<u16> = Vec::with_capacity(len);
         for _ in 0..len {
-            let ch = self.read_u16()?;
-            s.push(char::from_u32(ch as u32).unwrap_or('\u{FFFD}'));
+            units.push(self.read_u16()?);
         }
-        Ok(s)
+        Ok(String::from_utf16_lossy(&units))
     }
 
     fn remaining(&self) -> usize {
@@ -390,9 +389,10 @@ impl Writer {
     }
 
     fn write_unicode_string(&mut self, s: &str) {
-        self.write_u32(s.chars().count() as u32);
-        for ch in s.chars() {
-            self.write_u16(ch as u16);
+        let units: Vec<u16> = s.encode_utf16().collect();
+        self.write_u32(units.len() as u32);
+        for unit in units {
+            self.write_u16(unit);
         }
     }
 

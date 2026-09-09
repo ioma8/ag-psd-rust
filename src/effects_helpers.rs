@@ -2,15 +2,15 @@
 //!
 //! Provides utilities for reading and writing layer effects from PSD files.
 
+use crate::api::effects::*;
+use crate::api::types::{BevelDirection, BevelStyle, BlendMode, Color, Units, UnitsValue};
+use crate::io::reader::PsdReader;
+use crate::io::writer::PsdWriter;
 use crate::support::binrw_support::{
     decode_be, encode_be, EffectBlockHeaderRecord, EffectsCommonStateRecord, EffectsHeaderRecord,
 };
-use crate::api::effects::*;
 use crate::support::error::{PsdError, Result};
 use crate::support::helpers::{clamp, from_blend_mode, to_blend_mode};
-use crate::io::reader::PsdReader;
-use crate::api::types::{BevelDirection, BevelStyle, BlendMode, Color, Units, UnitsValue};
-use crate::io::writer::PsdWriter;
 use std::io::{Read, Seek};
 
 /// Default black color used when no color is specified.

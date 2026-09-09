@@ -4,10 +4,11 @@
 //! vector masks, layer effects, smart objects, and other layer properties.
 
 use crate::api::adjustments::AdjustmentLayer;
+use crate::api::types::ColorMode;
 use crate::support::binrw_support::{
     decode_be, encode_be, AnnotationHeaderRecord, LayerColorRecord, NameSourceRecord,
-    ProtectedFlagsRecord, SectionDividerBaseRecord, SectionDividerExtendedRecord,
-    U32ValueRecord, U8BoolRecord, UsingAlignedRenderingRecord,
+    ProtectedFlagsRecord, SectionDividerBaseRecord, SectionDividerExtendedRecord, U32ValueRecord,
+    U8BoolRecord, UsingAlignedRenderingRecord,
 };
 use crate::support::compression;
 use crate::support::descriptor::{Descriptor, DescriptorValue};
@@ -99,9 +100,7 @@ fn linked_file_uses_versioned_paths(info: &LinkedFileInfo) -> bool {
 
 fn validate_linked_file_item(item: &LinkedFile) -> Result<()> {
     let version = item.item_version.unwrap_or(7);
-    let kind = item
-        .data_kind
-        .unwrap_or(LinkedFileDataKind::Data);
+    let kind = item.data_kind.unwrap_or(LinkedFileDataKind::Data);
 
     if kind == LinkedFileDataKind::External {
         if item.descriptor.is_none() {
@@ -175,18 +174,20 @@ fn validate_linked_file_item(item: &LinkedFile) -> Result<()> {
 
     Ok(())
 }
-use crate::support::helpers::{from_blend_mode, to_blend_mode, ProtectedFlagsBits, VectorMaskFlagsBits};
 use crate::api::layer::{
     KeyDescriptorItem, Layer, LinkedFile, LinkedFileInfo, RRectRadii, VectorOrigination,
 };
-use crate::io::reader::PsdReader;
 use crate::api::text::UnitsBounds;
 use crate::api::types::Color;
 use crate::api::types::{
     BlendMode, LinkedFileDataKind, PixelData, Point, PsdIntCode, PsdStringCode, PsdU32Code,
     SectionDividerType, Units, UnitsValue, RGB,
 };
+use crate::io::reader::PsdReader;
 use crate::io::writer::PsdWriter;
+use crate::support::helpers::{
+    from_blend_mode, to_blend_mode, ProtectedFlagsBits, VectorMaskFlagsBits,
+};
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
@@ -300,6 +301,92 @@ pub struct RawTaggedBlock {
 pub struct TextEngineBlock {
     pub data: crate::support::engine_data::EngineValue,
     pub raw: Option<Vec<u8>>,
+}
+
+/// Recursively drop cached raw bytes for text structures so typed edits are
+/// serialized instead of silently shadowed by the preserved wire bytes.
+pub(crate) fn invalidate_text_layer_caches(psd: &mut crate::api::psd::Psd) {
+    // A stale document engine would shadow edited/added text objects; drop it
+    // so the prewrite regenerates the engine from the layer tree.
+    psd.additional_info.text_engine = None;
+    if let Some(children) = psd.children.as_mut() {
+        for layer in children {
+            invalidate_layer_text_caches(layer);
+        }
+    }
+}
+
+/// Normalized text comparison: `\r` on the wire maps to `\n` in the typed
+/// `text` field.
+fn normalized_text(text: &str) -> String {
+    text.replace('\r', "\n")
+}
+
+/// Keep the displayed text of a text descriptor in sync with the typed
+/// `text` field right before serialization. The wire payload stores the
+/// visible string in the `Txt ` item and mirrors it inside the EngineData
+/// blob; a typed edit updates the item and every matching EngineData string,
+/// leaving all other descriptor content untouched.
+pub(crate) fn sync_text_descriptor_content(td: &mut Descriptor, text: &str) {
+    let wire_text = text.replace('\n', "\r");
+    let edited = match td.items.get("Txt ") {
+        Some(DescriptorValue::Text(current)) => normalized_text(current) != normalized_text(text),
+        _ => true,
+    };
+    if !edited {
+        return;
+    }
+    td.items
+        .insert("Txt ".to_string(), DescriptorValue::Text(wire_text.clone()));
+
+    if let Some(DescriptorValue::DataBytes(bytes)) = td.items.get_mut("EngineData") {
+        if let Ok(mut engine) = crate::support::engine_data::parse_engine_data(bytes) {
+            fn update_strings(value: &mut crate::support::engine_data::EngineValue, text: &str) {
+                match value {
+                    crate::support::engine_data::EngineValue::String(s) => {
+                        if normalized_text(s) == normalized_text(text) {
+                            *s = text.replace('\n', "\r");
+                        }
+                    }
+                    crate::support::engine_data::EngineValue::Array(items) => {
+                        for item in items {
+                            update_strings(item, text);
+                        }
+                    }
+                    crate::support::engine_data::EngineValue::Object(map) => {
+                        for value in map.values_mut() {
+                            update_strings(value, text);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            update_strings(&mut engine, text);
+            if let Ok(serialized) =
+                crate::support::engine_data::serialize_engine_data(&engine, true)
+            {
+                *bytes = serialized;
+            }
+        }
+    }
+}
+
+fn invalidate_info_text_caches(info: &mut LayerAdditionalInfo) {
+    if let Some(text) = info.text.as_mut() {
+        text.raw_bytes = None;
+    }
+    if let Some(engine) = info.text_engine.as_mut() {
+        engine.raw = None;
+    }
+}
+
+fn invalidate_layer_text_caches(layer: &mut crate::api::layer::Layer) {
+    invalidate_info_text_caches(&mut layer.additional_info);
+    if let Some(children) = layer.children.as_mut() {
+        for child in children {
+            invalidate_layer_text_caches(child);
+        }
+    }
 }
 
 /// Annotation item (Anno)
@@ -981,7 +1068,8 @@ impl<R: Read + Seek> PsdReader<R> {
             "fxrp" => self.read_reference_point(info)?,
             "TySh" => {
                 let bytes = self.read_bytes(length)?;
-                let mut sub = PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
+                let mut sub =
+                    PsdReader::new(std::io::Cursor::new(bytes.clone()), Default::default());
                 sub.read_text_layer(info, length)?;
                 if let Some(text) = info.text.as_mut() {
                     text.raw_bytes = Some(bytes);
@@ -1006,7 +1094,12 @@ impl<R: Read + Seek> PsdReader<R> {
             "Lr16" | "Lr32" => {
                 let data = self.read_bytes(length)?;
                 let bits = if key == "Lr16" { 16 } else { 32 };
-                let layers = crate::io::reader::read_nested_layer_info_block(&data, bits)?;
+                let layers = crate::io::reader::read_nested_layer_info_block(
+                    &data,
+                    bits,
+                    self.large,
+                    self.color_mode.unwrap_or(ColorMode::RGB),
+                )?;
                 info.high_depth_layer_data = Some(HighDepthLayerInfo {
                     key: PsdStringCode::from(key),
                     layers,
@@ -1060,7 +1153,13 @@ impl<R: Read + Seek> PsdReader<R> {
                     if kind == "liFA" {
                         let _alias_padding = read_u64_parts(self)?;
                     }
-                    let data = self.read_bytes(payload_length as usize)?;
+                    let data = if self.options.skip_linked_files_data.unwrap_or(false) {
+                        // Payload is consumed but not retained when requested.
+                        self.read_bytes(payload_length as usize)?;
+                        None
+                    } else {
+                        Some(self.read_bytes(payload_length as usize)?)
+                    };
                     let child_document_id =
                         if item_version >= 5 && self.offset < chunk_start + chunk_length {
                             Some(self.read_unicode_string()?)
@@ -1115,7 +1214,7 @@ impl<R: Read + Seek> PsdReader<R> {
                         data_kind: Some(LinkedFileDataKind::from_code(&kind)),
                         file_type: Some(PsdStringCode(file_type)),
                         creator: Some(PsdStringCode(creator)),
-                        data: Some(data),
+                        data,
                         time,
                         descriptor,
                         child_document_id,
@@ -1164,19 +1263,21 @@ impl<R: Read + Seek> PsdReader<R> {
             }
             "Txt2" => {
                 let raw = self.read_bytes(length)?;
-                let parsed = crate::support::engine_data::parse_engine_data(&raw).or_else(|_| {
-                    if raw.len() < 4 {
-                        return Err(PsdError::InvalidFormat(
-                            "invalid Txt2 payload".to_string(),
-                        ));
-                    }
-                    let inner_length =
-                        u32::from_be_bytes(raw[..4].try_into().expect("Txt2 inner length")) as usize;
-                    let available = raw.len().saturating_sub(4);
-                    let bounded = inner_length.min(available);
-                    crate::support::engine_data::parse_engine_data(&raw[4..4 + bounded])
-                        .map_err(|e| PsdError::InvalidFormat(e.to_string()))
-                })?;
+                let parsed =
+                    crate::support::engine_data::parse_engine_data(&raw).or_else(|_| {
+                        if raw.len() < 4 {
+                            return Err(PsdError::InvalidFormat(
+                                "invalid Txt2 payload".to_string(),
+                            ));
+                        }
+                        let inner_length =
+                            u32::from_be_bytes(raw[..4].try_into().expect("Txt2 inner length"))
+                                as usize;
+                        let available = raw.len().saturating_sub(4);
+                        let bounded = inner_length.min(available);
+                        crate::support::engine_data::parse_engine_data(&raw[4..4 + bounded])
+                            .map_err(|e| PsdError::InvalidFormat(e.to_string()))
+                    })?;
                 info.text_engine = Some(TextEngineBlock {
                     data: parsed,
                     raw: Some(raw),
@@ -1198,6 +1299,7 @@ impl<R: Read + Seek> PsdReader<R> {
                 let header: AnnotationHeaderRecord =
                     decode_be(&self.read_bytes(8)?, "annotation header")?;
                 let count = header.count as usize;
+                crate::support::limits::check_container_count(count as u64, "annotation count")?;
                 let mut items = Vec::with_capacity(count);
                 for _ in 0..count {
                     let item_length = self.read_u32()? as usize;
@@ -1233,7 +1335,8 @@ impl<R: Read + Seek> PsdReader<R> {
                     }
                     let chars_len = self.read_u32()? as usize;
                     self.skip_bytes(2)?;
-                    let text = self.read_unicode_string_with_length(chars_len.saturating_sub(2) / 2)?;
+                    let text =
+                        self.read_unicode_string_with_length(chars_len.saturating_sub(2) / 2)?;
                     let consumed = (self.offset - item_start) as usize;
                     if consumed < item_length {
                         self.skip_bytes(item_length - consumed)?;
@@ -1319,7 +1422,9 @@ impl<R: Read + Seek> PsdReader<R> {
                                                 let row_lengths: Vec<u32> = slot_bytes
                                                     [2..2 + row_table_bytes]
                                                     .chunks_exact(2)
-                                                    .map(|b| u16::from_be_bytes([b[0], b[1]]) as u32)
+                                                    .map(|b| {
+                                                        u16::from_be_bytes([b[0], b[1]]) as u32
+                                                    })
                                                     .collect();
                                                 let encoded = &slot_bytes[2 + row_table_bytes..];
                                                 let mut out = vec![0u8; output_size];
@@ -1660,7 +1765,11 @@ impl<R: Read + Seek> PsdReader<R> {
     }
 
     /// Read text layer data (TySh)
-    fn read_text_layer(&mut self, info: &mut LayerAdditionalInfo, _length: usize) -> Result<()> {
+    pub(crate) fn read_text_layer(
+        &mut self,
+        info: &mut LayerAdditionalInfo,
+        _length: usize,
+    ) -> Result<()> {
         let version = self.read_i16()?;
         if version != 1 {
             return Err(PsdError::InvalidFormat(format!(
@@ -2153,6 +2262,7 @@ impl<R: Read + Seek> PsdReader<R> {
     /// Read metadata (shmd)
     fn read_metadata(&mut self, info: &mut LayerAdditionalInfo, _length: usize) -> Result<()> {
         let count = self.read_u32()?;
+        crate::support::limits::check_container_count(count as u64, "metadata count")?;
         let mut entries = Vec::with_capacity(count as usize);
         for _ in 0..count {
             let _sig = self.read_signature()?; // "8BIM"
@@ -2353,6 +2463,9 @@ impl PsdWriter {
         info: &LayerAdditionalInfo,
     ) -> Result<usize> {
         let mut temp_writer = PsdWriter::new(1024);
+        temp_writer.large = self.large;
+        temp_writer.color_mode = self.color_mode;
+        temp_writer.global_alpha = self.global_alpha;
 
         match key {
             "luni" => {
@@ -2570,14 +2683,15 @@ impl PsdWriter {
                         }
                         temp_writer.write_i16(50)?; // text version
                         if let Some(ref td) = text.text_data {
-                            temp_writer.write_version_and_descriptor(text.descriptor_version, td)?;
+                            let mut td = td.clone();
+                            sync_text_descriptor_content(&mut td, &text.text);
+                            temp_writer
+                                .write_version_and_descriptor(text.descriptor_version, &td)?;
                         }
                         temp_writer.write_i16(text.warp_version as i16)?;
                         if let Some(ref wd) = text.warp_data {
-                            temp_writer.write_version_and_descriptor(
-                                text.warp_descriptor_version,
-                                wd,
-                            )?;
+                            temp_writer
+                                .write_version_and_descriptor(text.warp_descriptor_version, wd)?;
                         }
                         temp_writer.write_i32(text.left)?;
                         temp_writer.write_i32(text.top)?;
@@ -2670,27 +2784,7 @@ impl PsdWriter {
                         key: &str,
                         value: &DescriptorValue,
                     ) -> Result<()> {
-                        let sig = match value {
-                            DescriptorValue::Boolean(_) => "bool",
-                            DescriptorValue::Integer(_) => "long",
-                            DescriptorValue::Double(_) => "doub",
-                            DescriptorValue::Float(_) => "DBL ",
-                            DescriptorValue::Descriptor(_) => "Objc",
-                            DescriptorValue::GlobalObject(_) => "GlbO",
-                            DescriptorValue::List(_) => "VlLs",
-                            DescriptorValue::UnitDouble { .. } => "UntF",
-                            DescriptorValue::UnitFloat { .. } => "UnFl",
-                            DescriptorValue::Text(_) => "TEXT",
-                            DescriptorValue::Enum { .. } => "Enmr",
-                            DescriptorValue::Class { .. } => "type",
-                            DescriptorValue::Reference(_) => "obj ",
-                            DescriptorValue::DataBytes(_) => "tdta",
-                            DescriptorValue::Property(_) => "prop",
-                            DescriptorValue::LargeInteger { .. } => "comp",
-                            DescriptorValue::Alias(_) => "alis",
-                            DescriptorValue::FilePath { .. } => "Pth ",
-                            DescriptorValue::ObjectArray { .. } => "ObAr",
-                        };
+                        let sig = crate::support::descriptor::ostype_sig(value);
                         writer.write_ascii_string_or_class_id(key)?;
                         writer.write_signature(sig)?;
                         writer.write_ostype(value)
@@ -2789,38 +2883,9 @@ impl PsdWriter {
                         value: &DescriptorValue,
                     ) -> Result<()> {
                         writer.write_ascii_string_or_class_id(key)?;
-                        match value {
-                            DescriptorValue::Enum { enum_type, value } => {
-                                writer.write_signature("enum")?;
-                                writer.write_ascii_string_or_class_id(enum_type)?;
-                                writer.write_ascii_string_or_class_id(value)
-                            }
-                            _ => {
-                                let sig = match value {
-                                    DescriptorValue::Boolean(_) => "bool",
-                                    DescriptorValue::Integer(_) => "long",
-                                    DescriptorValue::Double(_) => "doub",
-                                    DescriptorValue::Float(_) => "DBL ",
-                                    DescriptorValue::Descriptor(_) => "Objc",
-                                    DescriptorValue::GlobalObject(_) => "GlbO",
-                                    DescriptorValue::List(_) => "VlLs",
-                                    DescriptorValue::UnitDouble { .. } => "UntF",
-                                    DescriptorValue::UnitFloat { .. } => "UnFl",
-                                    DescriptorValue::Text(_) => "TEXT",
-                                    DescriptorValue::Enum { .. } => unreachable!(),
-                                    DescriptorValue::Class { .. } => "type",
-                                    DescriptorValue::Reference(_) => "obj ",
-                                    DescriptorValue::DataBytes(_) => "tdta",
-                                    DescriptorValue::Property(_) => "prop",
-                                    DescriptorValue::LargeInteger { .. } => "comp",
-                                    DescriptorValue::Alias(_) => "alis",
-                                    DescriptorValue::FilePath { .. } => "Pth ",
-                                    DescriptorValue::ObjectArray { .. } => "ObAr",
-                                };
-                                writer.write_signature(sig)?;
-                                writer.write_ostype(value)
-                            }
-                        }
+                        let sig = crate::support::descriptor::ostype_sig(value);
+                        writer.write_signature(sig)?;
+                        writer.write_ostype(value)
                     }
 
                     fn write_plld_warp_descriptor(
@@ -2850,10 +2915,14 @@ impl PsdWriter {
                                     if let DescriptorValue::Descriptor(bounds) = value {
                                         writer.write_ascii_string_or_class_id(key)?;
                                         writer.write_signature("Objc")?;
-                                        writer.write_class_structure(&bounds.name, &bounds.class_id)?;
+                                        writer.write_class_structure(
+                                            &bounds.name,
+                                            &bounds.class_id,
+                                        )?;
                                         writer.write_u32(bounds.items.len() as u32)?;
                                         for bounds_key in ["Top ", "Left", "Btom", "Rght"] {
-                                            if let Some(bounds_value) = bounds.items.get(bounds_key) {
+                                            if let Some(bounds_value) = bounds.items.get(bounds_key)
+                                            {
                                                 write_legacy_plld_entry(
                                                     writer,
                                                     bounds_key,
@@ -2997,7 +3066,8 @@ impl PsdWriter {
                         let mut item_writer = PsdWriter::new(256);
                         let kind = item.data_kind.unwrap_or(LinkedFileDataKind::Data);
                         let version = item.item_version.unwrap_or(7);
-                        item_writer.write_signature(std::str::from_utf8(&kind.to_code()).unwrap())?;
+                        item_writer
+                            .write_signature(std::str::from_utf8(&kind.to_code()).unwrap())?;
                         item_writer.write_u32(version)?;
                         item_writer.write_pascal_string(&item.id, 1)?;
                         item_writer.write_unicode_string_with_padding(&item.name)?;
@@ -3144,9 +3214,11 @@ impl PsdWriter {
                     if let Some(ref raw) = text_engine.raw {
                         temp_writer.write_bytes(raw)?;
                     } else {
-                        let bytes =
-                            crate::support::engine_data::serialize_engine_data(&text_engine.data, true)
-                                .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
+                        let bytes = crate::support::engine_data::serialize_engine_data(
+                            &text_engine.data,
+                            true,
+                        )
+                        .map_err(|e| PsdError::InvalidFormat(e.to_string()))?;
                         temp_writer.write_bytes(&bytes)?;
                     }
                 }
@@ -3365,8 +3437,9 @@ pub fn read_layer_additional_info<R: Read + Seek>(
 
         let key = reader.read_signature()?;
         info.tagged_block_order.push(key.clone());
-        let data_length = if signature == "8B64" {
-            // Read 64-bit length
+        let data_length = if signature == "8B64" || (reader.large && tagged_block_u64_key(&key)) {
+            // 64-bit length: mandated by the 8B64 signature and, in PSB
+            // documents, by the key table regardless of signature.
             let high = reader.read_u32()?;
             if high != 0 {
                 return Err(PsdError::InvalidFormat(
@@ -3378,7 +3451,12 @@ pub fn read_layer_additional_info<R: Read + Seek>(
             reader.read_u32()? as usize
         };
         let block_start = reader.offset;
-        reader.read_additional_info(&key, data_length, &mut info)?;
+        // Bound the handler to this block so it cannot overread into the next
+        // tagged block and mask the overread by seeking back.
+        let previous_bound = reader.push_section_bound(block_start + data_length as u64);
+        let handler_result = reader.read_additional_info(&key, data_length, &mut info);
+        reader.pop_section_bound(previous_bound);
+        handler_result?;
 
         // Handlers may under-read; the block length is authoritative.
         reader.seek_to(block_start + data_length as u64)?;
@@ -3389,38 +3467,47 @@ pub fn read_layer_additional_info<R: Read + Seek>(
         }
         let pad = (4 - (data_length % 4)) % 4;
         let remaining = (length as u64 - consumed) as usize;
-        reader.skip_bytes(pad.min(remaining))?;
+        if remaining < pad {
+            return Err(PsdError::InvalidFormat(format!(
+                "Tagged block {} is missing {} padding byte(s)",
+                key,
+                pad - remaining
+            )));
+        }
+        if pad != 0 {
+            reader.read_bytes(pad)?;
+        }
     }
 
     Ok(info)
 }
 
-fn tagged_block_uses_u64_length(key: &str, large: bool) -> bool {
-    large
-        && matches!(
-            key,
-            "LMsk"
-                | "Lr16"
-                | "Lr32"
-                | "Layr"
-                | "Mt16"
-                | "Mt32"
-                | "Mtrn"
-                | "Alph"
-                | "FMsk"
-                | "lnk2"
-                | "FEid"
-                | "FXid"
-                | "PxSD"
-        )
+/// Keys whose tagged-block length is 8 bytes in PSB documents (the "8B64"
+/// group). Adobe specifies the width by key as well as by signature.
+fn tagged_block_u64_key(key: &str) -> bool {
+    matches!(
+        key,
+        "LMsk"
+            | "Lr16"
+            | "Lr32"
+            | "Layr"
+            | "Mt16"
+            | "Mt32"
+            | "Mtrn"
+            | "Alph"
+            | "FMsk"
+            | "lnk2"
+            | "FEid"
+            | "FXid"
+            | "PxSD"
+    )
 }
 
-fn write_tagged_block(
-    writer: &mut PsdWriter,
-    key: &str,
-    data: &[u8],
-    large: bool,
-) -> Result<()> {
+fn tagged_block_uses_u64_length(key: &str, large: bool) -> bool {
+    large && tagged_block_u64_key(key)
+}
+
+fn write_tagged_block(writer: &mut PsdWriter, key: &str, data: &[u8], large: bool) -> Result<()> {
     let signature = if tagged_block_uses_u64_length(key, large) {
         "8B64"
     } else {
@@ -3431,7 +3518,10 @@ fn write_tagged_block(
     if signature == "8B64" {
         writer.write_u32(0)?;
     }
-    writer.write_u32(data.len() as u32)?;
+    let length = u32::try_from(data.len()).map_err(|_| {
+        PsdError::UnsupportedFeature(format!("Tagged block {} exceeds the 4GiB wire limit", key))
+    })?;
+    writer.write_u32(length)?;
     writer.write_bytes(data)?;
     let pad = (4 - (data.len() % 4)) % 4;
     if pad != 0 {
@@ -3466,6 +3556,9 @@ fn write_additional_info_subset_with_options(
             continue;
         }
         let mut temp_writer = PsdWriter::new(1024);
+        temp_writer.large = large;
+        temp_writer.color_mode = writer.color_mode;
+        temp_writer.global_alpha = writer.global_alpha;
         let length = temp_writer.write_additional_info(key, info)?;
         if length > 0 {
             modeled_blocks.push((disk_key(key).to_string(), temp_writer.into_buffer()));
@@ -3493,10 +3586,7 @@ fn write_additional_info_subset_with_options(
         }
     }
 
-    let emitted_keys: HashSet<&str> = modeled_blocks
-        .iter()
-        .map(|(key, _)| key.as_str())
-        .collect();
+    let emitted_keys: HashSet<&str> = modeled_blocks.iter().map(|(key, _)| key.as_str()).collect();
 
     let mut modeled_by_key: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
     for (key, data) in &modeled_blocks {
@@ -3597,10 +3687,12 @@ pub(crate) fn write_document_additional_info_with_options(
     large: bool,
 ) -> Result<()> {
     let sections = [
-        "Txt2", "shmd", "Patt", "Pat2", "Pat3", "Anno", "lnk2", "lnkD", "lnkD__", "lnk3",
-        "FEid", "PxSD", "FMsk", "Mtrn", "Mt16", "Mt32", "cinf", "abdd", "anFX", "SoLE",
+        "Txt2", "shmd", "Patt", "Pat2", "Pat3", "Anno", "lnk2", "lnkD", "lnkD__", "lnk3", "FEid",
+        "PxSD", "FMsk", "Mtrn", "Mt16", "Mt32", "Lr16", "Lr32", "cinf", "abdd", "anFX", "SoLE",
     ];
-    let raw_only_sections = ["FMsk", "Mtrn", "Mt16", "Mt32", "cinf", "abdd", "anFX", "SoLE"];
+    let raw_only_sections = [
+        "FMsk", "Mtrn", "Mt16", "Mt32", "cinf", "abdd", "anFX", "SoLE",
+    ];
     use std::collections::{HashMap, HashSet, VecDeque};
 
     fn disk_key(key: &str) -> &str {
@@ -3617,6 +3709,9 @@ pub(crate) fn write_document_additional_info_with_options(
             continue;
         }
         let mut temp_writer = PsdWriter::new(1024);
+        temp_writer.large = large;
+        temp_writer.color_mode = writer.color_mode;
+        temp_writer.global_alpha = writer.global_alpha;
         let length = temp_writer.write_additional_info(key, info)?;
         if length > 0 {
             modeled_blocks.push((disk_key(key).to_string(), temp_writer.into_buffer()));
@@ -3641,7 +3736,10 @@ pub(crate) fn write_document_additional_info_with_options(
     let emitted_keys: HashSet<&str> = modeled_blocks.iter().map(|(key, _)| key.as_str()).collect();
     let mut modeled_by_key: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
     for (key, data) in &modeled_blocks {
-        modeled_by_key.entry(key.clone()).or_default().push_back(data.clone());
+        modeled_by_key
+            .entry(key.clone())
+            .or_default()
+            .push_back(data.clone());
     }
     let mut raw_by_key: HashMap<String, VecDeque<Vec<u8>>> = HashMap::new();
     for raw in &info.raw_blocks {
@@ -3781,7 +3879,10 @@ mod tests {
             .read_additional_info("lclr", length, &mut read_info)
             .unwrap();
 
-        assert_eq!(read_info.layer_color, Some(crate::api::types::LayerColor::Blue));
+        assert_eq!(
+            read_info.layer_color,
+            Some(crate::api::types::LayerColor::Blue)
+        );
     }
 
     #[test]
@@ -4244,6 +4345,7 @@ mod tests {
                     data: Some(vec![0x12, 0x34]),
                 }],
                 large: false,
+                preview: None,
             }),
             ..Layer::default()
         };
@@ -4591,24 +4693,28 @@ mod tests {
         .expect("read sample");
         let psd = crate::read_psd(std::io::Cursor::new(original), Default::default())
             .expect("parse sample");
-        let layer = psd
-            .children
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .find_map(|layer| {
-                fn find<'a>(layer: &'a crate::Layer, name: &str) -> Option<&'a crate::Layer> {
-                    if layer.additional_info.name.as_deref() == Some(name) {
-                        return Some(layer);
+        let layer =
+            psd.children
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .find_map(|layer| {
+                    fn find<'a>(layer: &'a crate::Layer, name: &str) -> Option<&'a crate::Layer> {
+                        if layer.additional_info.name.as_deref() == Some(name) {
+                            return Some(layer);
+                        }
+                        layer.children.as_deref().and_then(|children| {
+                            children.iter().find_map(|child| find(child, name))
+                        })
                     }
-                    layer.children
-                        .as_deref()
-                        .and_then(|children| children.iter().find_map(|child| find(child, name)))
-                }
-                find(layer, "4")
-            })
-            .expect("sample layer 4");
-        let placed = layer.additional_info.placed_layer.as_ref().expect("placed layer");
+                    find(layer, "4")
+                })
+                .expect("sample layer 4");
+        let placed = layer
+            .additional_info
+            .placed_layer
+            .as_ref()
+            .expect("placed layer");
         assert!(
             !placed.transform.is_empty(),
             "PlLd transform should survive SoLd parsing on placed layers"
@@ -4631,8 +4737,8 @@ mod tests {
             offset += 4;
             let _layer_info_len = read_u32(&data, offset) as usize;
             offset += 4;
-            let layer_count =
-                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            let layer_count = i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16"))
+                .abs() as usize;
             offset += 2;
 
             for _ in 0..layer_count {
@@ -4648,7 +4754,8 @@ mod tests {
                 let blend_len = read_u32(&data, offset) as usize;
                 offset += 4 + blend_len;
                 let name_len = data[offset] as usize;
-                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let name =
+                    String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
                 let padded_name_len = ((name_len + 1) + 3) & !3;
                 offset += padded_name_len;
 
@@ -4659,7 +4766,8 @@ mod tests {
                         break;
                     }
                     let block_key =
-                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8])
+                            .to_string();
                     let length = read_u32(&data, tagged_offset + 8) as usize;
                     let data_start = tagged_offset + 12;
                     let data_end = data_start + length;
@@ -4687,8 +4795,11 @@ mod tests {
             .join("samples")
             .join("3d-preview-mockup.psd");
         let original_block = extract_named_block(&path, "4", "vmsk");
-        let psd = crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
-            .expect("parse sample");
+        let psd = crate::read_psd(
+            std::io::Cursor::new(std::fs::read(&path).expect("read sample")),
+            Default::default(),
+        )
+        .expect("parse sample");
         fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
             for layer in layers {
                 if layer.additional_info.name.as_deref() == Some(name) {
@@ -4704,7 +4815,8 @@ mod tests {
             }
             None
         }
-        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+        let layer =
+            find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
 
         let mut writer = PsdWriter::new(512);
         let length = writer
@@ -4713,7 +4825,10 @@ mod tests {
         let rewritten = writer.into_buffer();
 
         assert_eq!(length, original_block.len(), "vmsk block length changed");
-        assert_eq!(rewritten, original_block, "vmsk bytes changed after semantic roundtrip");
+        assert_eq!(
+            rewritten, original_block,
+            "vmsk bytes changed after semantic roundtrip"
+        );
     }
 
     #[test]
@@ -4732,8 +4847,8 @@ mod tests {
             offset += 4;
             let _layer_info_len = read_u32(&data, offset) as usize;
             offset += 4;
-            let layer_count =
-                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            let layer_count = i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16"))
+                .abs() as usize;
             offset += 2;
 
             for _ in 0..layer_count {
@@ -4749,7 +4864,8 @@ mod tests {
                 let blend_len = read_u32(&data, offset) as usize;
                 offset += 4 + blend_len;
                 let name_len = data[offset] as usize;
-                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let name =
+                    String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
                 let padded_name_len = ((name_len + 1) + 3) & !3;
                 offset += padded_name_len;
 
@@ -4760,7 +4876,8 @@ mod tests {
                         break;
                     }
                     let block_key =
-                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8])
+                            .to_string();
                     let length = read_u32(&data, tagged_offset + 8) as usize;
                     let data_start = tagged_offset + 12;
                     let data_end = data_start + length;
@@ -4788,9 +4905,11 @@ mod tests {
             .join("samples")
             .join("3d-preview-mockup.psd");
         let original_block = extract_named_block(&path, "4", "PlLd");
-        let psd =
-            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
-                .expect("parse sample");
+        let psd = crate::read_psd(
+            std::io::Cursor::new(std::fs::read(&path).expect("read sample")),
+            Default::default(),
+        )
+        .expect("parse sample");
         fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
             for layer in layers {
                 if layer.additional_info.name.as_deref() == Some(name) {
@@ -4806,7 +4925,8 @@ mod tests {
             }
             None
         }
-        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+        let layer =
+            find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
 
         let mut writer = PsdWriter::new(2048);
         let length = writer
@@ -4815,7 +4935,10 @@ mod tests {
         let rewritten = writer.into_buffer();
 
         assert_eq!(length, original_block.len(), "PlLd block length changed");
-        assert_eq!(rewritten, original_block, "PlLd bytes changed after semantic roundtrip");
+        assert_eq!(
+            rewritten, original_block,
+            "PlLd bytes changed after semantic roundtrip"
+        );
     }
 
     #[test]
@@ -4834,8 +4957,8 @@ mod tests {
             offset += 4;
             let _layer_info_len = read_u32(&data, offset) as usize;
             offset += 4;
-            let layer_count =
-                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            let layer_count = i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16"))
+                .abs() as usize;
             offset += 2;
 
             for _ in 0..layer_count {
@@ -4851,7 +4974,8 @@ mod tests {
                 let blend_len = read_u32(&data, offset) as usize;
                 offset += 4 + blend_len;
                 let name_len = data[offset] as usize;
-                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let name =
+                    String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
                 let padded_name_len = ((name_len + 1) + 3) & !3;
                 offset += padded_name_len;
 
@@ -4862,7 +4986,8 @@ mod tests {
                         break;
                     }
                     let block_key =
-                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8])
+                            .to_string();
                     let length = read_u32(&data, tagged_offset + 8) as usize;
                     let data_start = tagged_offset + 12;
                     let data_end = data_start + length;
@@ -4890,9 +5015,11 @@ mod tests {
             .join("samples")
             .join("4901393.psd");
         let original_block = extract_named_block(&path, "Plants", "PlLd");
-        let psd =
-            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
-                .expect("parse sample");
+        let psd = crate::read_psd(
+            std::io::Cursor::new(std::fs::read(&path).expect("read sample")),
+            Default::default(),
+        )
+        .expect("parse sample");
         fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
             for layer in layers {
                 if layer.additional_info.name.as_deref() == Some(name) {
@@ -4908,7 +5035,8 @@ mod tests {
             }
             None
         }
-        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "Plants").expect("plants layer");
+        let layer =
+            find_layer(psd.children.as_deref().unwrap_or(&[]), "Plants").expect("plants layer");
 
         let mut writer = PsdWriter::new(2048);
         let length = writer
@@ -4917,7 +5045,10 @@ mod tests {
         let rewritten = writer.into_buffer();
 
         assert_eq!(length, original_block.len(), "PlLd block length changed");
-        assert_eq!(rewritten, original_block, "PlLd bytes changed after semantic roundtrip");
+        assert_eq!(
+            rewritten, original_block,
+            "PlLd bytes changed after semantic roundtrip"
+        );
     }
 
     #[test]
@@ -4936,8 +5067,8 @@ mod tests {
             offset += 4;
             let _layer_info_len = read_u32(&data, offset) as usize;
             offset += 4;
-            let layer_count =
-                i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16")).abs() as usize;
+            let layer_count = i16::from_be_bytes(data[offset..offset + 2].try_into().expect("i16"))
+                .abs() as usize;
             offset += 2;
 
             for _ in 0..layer_count {
@@ -4953,7 +5084,8 @@ mod tests {
                 let blend_len = read_u32(&data, offset) as usize;
                 offset += 4 + blend_len;
                 let name_len = data[offset] as usize;
-                let name = String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
+                let name =
+                    String::from_utf8_lossy(&data[offset + 1..offset + 1 + name_len]).to_string();
                 let padded_name_len = ((name_len + 1) + 3) & !3;
                 offset += padded_name_len;
 
@@ -4964,7 +5096,8 @@ mod tests {
                         break;
                     }
                     let block_key =
-                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8]).to_string();
+                        String::from_utf8_lossy(&data[tagged_offset + 4..tagged_offset + 8])
+                            .to_string();
                     let length = read_u32(&data, tagged_offset + 8) as usize;
                     let data_start = tagged_offset + 12;
                     let data_end = data_start + length;
@@ -4992,9 +5125,11 @@ mod tests {
             .join("samples")
             .join("3d-preview-mockup.psd");
         let original_block = extract_named_block(&path, "4", "luni");
-        let psd =
-            crate::read_psd(std::io::Cursor::new(std::fs::read(&path).expect("read sample")), Default::default())
-                .expect("parse sample");
+        let psd = crate::read_psd(
+            std::io::Cursor::new(std::fs::read(&path).expect("read sample")),
+            Default::default(),
+        )
+        .expect("parse sample");
         fn find_layer<'a>(layers: &'a [crate::Layer], name: &str) -> Option<&'a crate::Layer> {
             for layer in layers {
                 if layer.additional_info.name.as_deref() == Some(name) {
@@ -5010,7 +5145,8 @@ mod tests {
             }
             None
         }
-        let layer = find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
+        let layer =
+            find_layer(psd.children.as_deref().unwrap_or(&[]), "4").expect("sample layer 4");
 
         let mut writer = PsdWriter::new(64);
         let length = writer
@@ -5019,7 +5155,15 @@ mod tests {
         let rewritten = writer.into_buffer();
 
         assert_eq!(length, 6, "canonical luni payload length changed");
-        assert_eq!(rewritten, original_block[..length], "luni content changed after semantic roundtrip");
-        assert_eq!(&original_block[length..], &[0, 0], "sample should only differ by legacy terminator");
+        assert_eq!(
+            rewritten,
+            original_block[..length],
+            "luni content changed after semantic roundtrip"
+        );
+        assert_eq!(
+            &original_block[length..],
+            &[0, 0],
+            "sample should only differ by legacy terminator"
+        );
     }
 }

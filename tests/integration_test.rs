@@ -41,8 +41,8 @@ fn document_tagged_block_keys(bytes: &[u8]) -> Vec<String> {
     let layer_info_start = offset + 4;
     offset = layer_info_start;
 
-    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
-        as usize;
+    let layer_count =
+        i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs() as usize;
     offset += 2;
 
     let mut channel_payload_bytes = 0usize;
@@ -114,8 +114,8 @@ fn document_tagged_block_data(bytes: &[u8], key: &str) -> Vec<u8> {
     let layer_info_start = offset + 4;
     offset = layer_info_start;
 
-    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
-        as usize;
+    let layer_count =
+        i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs() as usize;
     offset += 2;
 
     let mut channel_payload_bytes = 0usize;
@@ -188,8 +188,8 @@ fn layer_blending_range_lengths(bytes: &[u8]) -> Vec<u32> {
     let _layer_info_len = read_u32(bytes, offset) as usize;
     offset += 4;
 
-    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
-        as usize;
+    let layer_count =
+        i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs() as usize;
     offset += 2;
 
     let mut lengths = Vec::with_capacity(layer_count);
@@ -223,8 +223,8 @@ fn layer_extra_data(bytes: &[u8], layer_index: usize) -> Vec<u8> {
     offset += 4 + image_resources_len;
     offset += 4;
     offset += 4;
-    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
-        as usize;
+    let layer_count =
+        i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs() as usize;
     offset += 2;
     assert!(layer_index < layer_count, "layer index out of bounds");
 
@@ -257,8 +257,8 @@ fn layer_tagged_block_data(bytes: &[u8], layer_name: &str, key: &str) -> Vec<u8>
     offset += 4 + image_resources_len;
     offset += 4;
     offset += 4;
-    let layer_count = i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs()
-        as usize;
+    let layer_count =
+        i16::from_be_bytes(bytes[offset..offset + 2].try_into().expect("i16")).abs() as usize;
     offset += 2;
 
     for _ in 0..layer_count {
@@ -315,7 +315,16 @@ fn clear_text_raw_bytes(layers: &mut [Layer]) {
     }
 }
 
-fn layer_mask_semantics(mask: Option<&psd_great::layer::LayerMaskData>) -> Option<(Option<i32>, Option<i32>, Option<i32>, Option<i32>, Option<u8>, Option<Vec<u8>>)> {
+fn layer_mask_semantics(
+    mask: Option<&psd_great::layer::LayerMaskData>,
+) -> Option<(
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<i32>,
+    Option<u8>,
+    Option<Vec<u8>>,
+)> {
     mask.map(|mask| {
         (
             mask.top,
@@ -337,14 +346,12 @@ fn raw_block_semantics(
         .collect()
 }
 
-fn is_default_blending_ranges(
-    ranges: &psd_great::layer::LayerBlendingRangesData,
-) -> bool {
+fn is_default_blending_ranges(ranges: &psd_great::layer::LayerBlendingRangesData) -> bool {
     let default_pair = psd_great::layer::LayerBlendingRangePair {
         src_black: 0,
-        src_white: 0,
-        dst_black: 255,
-        dst_white: 255,
+        src_white: 65535,
+        dst_black: 0,
+        dst_white: 65535,
     };
     ranges.composite_gray.as_ref() == Some(&default_pair)
         && ranges.channels.iter().all(|pair| pair == &default_pair)
@@ -372,24 +379,27 @@ fn assert_layers_semantically_equal(expected: &[Layer], actual: &[Layer], strict
         assert_eq!(actual.left, expected.left, "layer left mismatch");
         assert_eq!(actual.bottom, expected.bottom, "layer bottom mismatch");
         assert_eq!(actual.right, expected.right, "layer right mismatch");
-        assert_eq!(actual.blend_mode, expected.blend_mode, "layer blend mismatch");
+        assert_eq!(
+            actual.blend_mode, expected.blend_mode,
+            "layer blend mismatch"
+        );
         assert_eq!(actual.opacity, expected.opacity, "layer opacity mismatch");
         assert_eq!(actual.hidden, expected.hidden, "layer hidden mismatch");
-        assert_eq!(actual.clipping, expected.clipping, "layer clipping mismatch");
+        assert_eq!(
+            actual.clipping, expected.clipping,
+            "layer clipping mismatch"
+        );
         assert_eq!(actual.opened, expected.opened, "layer open state mismatch");
         assert_eq!(
-            actual.additional_info.name,
-            expected.additional_info.name,
+            actual.additional_info.name, expected.additional_info.name,
             "layer name mismatch"
         );
         assert_eq!(
-            actual.additional_info.id,
-            expected.additional_info.id,
+            actual.additional_info.id, expected.additional_info.id,
             "layer id mismatch"
         );
         assert_eq!(
-            actual.additional_info.section_divider,
-            expected.additional_info.section_divider,
+            actual.additional_info.section_divider, expected.additional_info.section_divider,
             "layer section divider mismatch"
         );
         assert_eq!(
@@ -437,11 +447,13 @@ fn assert_psd_semantically_equal(expected: &Psd, actual: &Psd, strict_order: boo
     assert_eq!(actual.width, expected.width, "document width mismatch");
     assert_eq!(actual.height, expected.height, "document height mismatch");
     assert_eq!(
-        actual.bits_per_channel,
-        expected.bits_per_channel,
+        actual.bits_per_channel, expected.bits_per_channel,
         "document depth mismatch"
     );
-    assert_eq!(actual.color_mode, expected.color_mode, "color mode mismatch");
+    assert_eq!(
+        actual.color_mode, expected.color_mode,
+        "color mode mismatch"
+    );
     assert_eq!(
         actual.image_data.as_ref().map(|image| &image.data),
         expected.image_data.as_ref().map(|image| &image.data),
@@ -454,8 +466,7 @@ fn assert_psd_semantically_equal(expected: &Psd, actual: &Psd, strict_order: boo
     );
     if strict_order {
         assert_eq!(
-            actual.additional_info.tagged_block_order,
-            expected.additional_info.tagged_block_order,
+            actual.additional_info.tagged_block_order, expected.additional_info.tagged_block_order,
             "document tagged block order mismatch"
         );
     }
@@ -472,8 +483,14 @@ fn is_canonical_8bit_rgba_layer(layer: &Layer) -> bool {
         && layer.image_data.is_some()
         && layer.additional_info.mask.is_none()
         && layer.additional_info.real_mask.is_none()
-        && layer.top.zip(layer.bottom).is_some_and(|(top, bottom)| bottom >= top)
-        && layer.left.zip(layer.right).is_some_and(|(left, right)| right >= left)
+        && layer
+            .top
+            .zip(layer.bottom)
+            .is_some_and(|(top, bottom)| bottom >= top)
+        && layer
+            .left
+            .zip(layer.right)
+            .is_some_and(|(left, right)| right >= left)
 }
 
 fn assert_canonical_layers_drop_raw_data(layers: &[Layer]) {
@@ -755,7 +772,10 @@ fn layer_info_length_is_rounded_up_to_an_even_byte_count() {
         }
     }
 
-    assert!(checked > 0, "expected to validate at least one PSD candidate");
+    assert!(
+        checked > 0,
+        "expected to validate at least one PSD candidate"
+    );
 }
 
 #[test]
@@ -763,16 +783,22 @@ fn tysh_descriptor_version_is_preserved_on_roundtrip_for_sample_text_layer() {
     let path = in_repo_sample_fixtures_dir().join("4901393.psd");
     let original = fs::read(&path).expect("read sample fixture");
     let original_tysh = layer_tagged_block_data(&original, "Website", "TySh");
-    let original_descriptor_version =
-        u32::from_be_bytes(original_tysh[52..56].try_into().expect("descriptor version"));
+    let original_descriptor_version = u32::from_be_bytes(
+        original_tysh[52..56]
+            .try_into()
+            .expect("descriptor version"),
+    );
 
     let psd = read_psd(Cursor::new(&original), ReadOptions::default())
         .unwrap_or_else(|err| panic!("{}: parse failed: {err}", path.display()));
     let rewritten = write_psd(&psd, &WriteOptions::default())
         .unwrap_or_else(|err| panic!("{}: write failed: {err}", path.display()));
     let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
-    let rewritten_descriptor_version =
-        u32::from_be_bytes(rewritten_tysh[52..56].try_into().expect("descriptor version"));
+    let rewritten_descriptor_version = u32::from_be_bytes(
+        rewritten_tysh[52..56]
+            .try_into()
+            .expect("descriptor version"),
+    );
 
     assert_eq!(original_descriptor_version, 16);
     assert_eq!(rewritten_descriptor_version, original_descriptor_version);
@@ -801,8 +827,16 @@ fn tysh_semantic_rewrite_preserves_sample_text_layer_semantics() {
     assert_psd_semantically_equal(&psd, &reparsed, false);
     let rewritten_tysh = layer_tagged_block_data(&rewritten, "Website", "TySh");
     assert_eq!(
-        u32::from_be_bytes(rewritten_tysh[52..56].try_into().expect("descriptor version")),
-        u32::from_be_bytes(original_tysh[52..56].try_into().expect("descriptor version")),
+        u32::from_be_bytes(
+            rewritten_tysh[52..56]
+                .try_into()
+                .expect("descriptor version")
+        ),
+        u32::from_be_bytes(
+            original_tysh[52..56]
+                .try_into()
+                .expect("descriptor version")
+        ),
     );
 }
 
@@ -967,10 +1001,15 @@ fn psb_color_mode_data_uses_four_byte_section_length() {
     .unwrap();
     let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
     assert_eq!(
-        read.color_mode_data.as_ref().map(|data| data.bytes.as_slice()),
+        read.color_mode_data
+            .as_ref()
+            .map(|data| data.bytes.as_slice()),
         Some(&[9, 8, 7, 6][..])
     );
-    assert_eq!(read.children.as_ref().map(|children| children.len()), Some(1));
+    assert_eq!(
+        read.children.as_ref().map(|children| children.len()),
+        Some(1)
+    );
 }
 
 #[test]
@@ -1013,7 +1052,10 @@ fn psb_image_resources_use_four_byte_section_length() {
             .and_then(|resources| resources.icc_profile.as_deref()),
         Some(&[1, 2, 3, 4][..])
     );
-    assert_eq!(read.children.as_ref().map(|children| children.len()), Some(1));
+    assert_eq!(
+        read.children.as_ref().map(|children| children.len()),
+        Some(1)
+    );
 }
 
 #[test]
@@ -1051,8 +1093,141 @@ fn psb_rle_roundtrip() {
     )
     .unwrap();
     let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
-    assert_eq!(read.children.unwrap()[0].image_data.as_ref().unwrap().data[0], 50);
+    assert_eq!(
+        read.children.unwrap()[0].image_data.as_ref().unwrap().data[0],
+        50
+    );
     assert_eq!(read.image_data.unwrap().data[0], 99);
+}
+
+#[test]
+fn layer_clipping_byte_roundtrips() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            clipping: Some(1),
+            image_data: Some(PixelData {
+                data: vec![1, 2, 3, 4],
+                width: 1,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(read.children.unwrap()[0].clipping, Some(1));
+}
+
+#[test]
+fn long_unicode_layer_name_roundtrips_via_luni() {
+    // 300 astral + accented characters: legacy Pascal name (255 bytes max)
+    // must be truncated safely while the full name survives in `luni`.
+    let long_name: String = std::iter::repeat("é").take(300).collect();
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            additional_info: psd_great::LayerAdditionalInfo {
+                name: Some(long_name.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    let child = &read.children.unwrap()[0];
+    let unicode_name = child
+        .additional_info
+        .name
+        .as_deref()
+        .expect("luni name present");
+    assert_eq!(unicode_name, &long_name);
+}
+
+#[test]
+fn writing_composite_smaller_than_document_is_rejected() {
+    let psd = Psd {
+        width: 2,
+        height: 1,
+        color_mode: Some(ColorMode::RGB),
+        bits_per_channel: Some(8),
+        image_data: Some(PixelData {
+            data: vec![1, 2, 3, 4], // only covers 1 pixel of a 2-pixel doc
+            width: 1,
+            height: 1,
+        }),
+        ..Default::default()
+    };
+    let err = write_psd(&psd, &WriteOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("Composite pixel data"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn sixteen_bit_layer_distinct_pixels_and_native_capture() {
+    let psd = Psd {
+        width: 2,
+        height: 1,
+        channels: Some(4),
+        bits_per_channel: Some(16),
+        color_mode: Some(ColorMode::RGB),
+        image_data: Some(PixelData {
+            data: vec![40, 80, 120, 255, 200, 210, 220, 255],
+            width: 2,
+            height: 1,
+        }),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(2),
+            image_data: Some(PixelData {
+                data: vec![40, 80, 120, 255, 200, 210, 220, 255],
+                width: 2,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let read = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    let child = &read.children.unwrap()[0];
+    // Distinct source pixels must not collapse into one duplicated pixel.
+    assert_eq!(
+        child.image_data.as_ref().unwrap().data,
+        vec![40, 80, 120, 255, 200, 210, 220, 255]
+    );
+    // Native 16-bit samples are retained for unchanged resaves.
+    let raw = child.raw_data.as_ref().expect("raw 16-bit capture");
+    assert_eq!(raw.bits_per_channel, 16);
+    assert_eq!(raw.color_mode, ColorMode::RGB);
+    assert!(
+        raw.channels
+            .iter()
+            .all(|channel| channel.data.as_ref().map(|d| d.len()) == Some(4)),
+        "each of four channels holds two 16-bit samples"
+    );
 }
 
 #[test]
@@ -1370,6 +1545,8 @@ fn test_create_and_write_simple_psd() {
 
     // Write the PSD
     let options = WriteOptions {
+        overwrite_skipped_composite: None,
+        overwrite_skipped_thumbnail: None,
         compress: Some(false),
         psb: Some(false),
         generate_thumbnail: Some(false),
@@ -1450,6 +1627,410 @@ fn test_write_and_read_roundtrip() {
     assert_eq!(read_psd.channels, original_psd.channels);
     assert_eq!(read_psd.bits_per_channel, original_psd.bits_per_channel);
     assert_eq!(read_psd.color_mode, original_psd.color_mode);
+}
+
+#[test]
+fn unedited_resolution_resource_units_survive_roundtrip() {
+    use psd_great::image_resources::{MeasurementUnit, ResolutionInfo, ResolutionUnit};
+    let original = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        image_resources: Some(psd_great::image_resources::ImageResources {
+            resolution_info: Some(ResolutionInfo {
+                horizontal_res: 100.0,
+                horizontal_res_unit: ResolutionUnit::PixelsPerCentimeter,
+                width_unit: MeasurementUnit::Centimeters,
+                vertical_res: 250.0,
+                vertical_res_unit: ResolutionUnit::PixelsPerCentimeter,
+                height_unit: MeasurementUnit::Centimeters,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bytes = write_psd(&original, &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    // Unequal axes and original units survive an unchanged save.
+    assert_eq!(
+        reparsed.image_resources.as_ref().unwrap().resolution_info,
+        original.image_resources.as_ref().unwrap().resolution_info
+    );
+    assert_eq!(reparsed.resolution, Some(100.0));
+}
+
+#[test]
+fn changing_resolution_rewrites_the_resource() {
+    use psd_great::image_resources::{
+        ImageResources, MeasurementUnit, ResolutionInfo, ResolutionUnit,
+    };
+    let mut psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        image_resources: Some(ImageResources {
+            resolution_info: Some(ResolutionInfo {
+                horizontal_res: 100.0,
+                horizontal_res_unit: ResolutionUnit::PixelsPerCentimeter,
+                width_unit: MeasurementUnit::Centimeters,
+                vertical_res: 250.0,
+                vertical_res_unit: ResolutionUnit::PixelsPerCentimeter,
+                height_unit: MeasurementUnit::Centimeters,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    psd.resolution = Some(72.0);
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    let res = reparsed
+        .image_resources
+        .as_ref()
+        .unwrap()
+        .resolution_info
+        .as_ref()
+        .unwrap();
+    assert_eq!(res.horizontal_res, 72.0);
+    assert_eq!(res.vertical_res, 72.0);
+    assert_eq!(res.horizontal_res_unit, ResolutionUnit::PixelsPerInch);
+}
+
+#[test]
+fn short_display_info_1077_payload_is_preserved_opaquely() {
+    // A one-record payload can be shorter than the 28-byte typed layout; it
+    // must survive unchanged rather than disappear on save.
+    let payload: Vec<u8> = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        image_resources: Some(psd_great::image_resources::ImageResources {
+            display_info_raw: Some(payload.clone()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    assert_eq!(
+        reparsed
+            .image_resources
+            .as_ref()
+            .unwrap()
+            .display_info_raw
+            .as_deref(),
+        Some(&payload[..])
+    );
+    assert!(reparsed
+        .image_resources
+        .as_ref()
+        .unwrap()
+        .display_info_typed
+        .is_none());
+}
+
+#[test]
+fn grayscale_composite_alpha_is_preserved() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(2),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::Grayscale),
+        image_data: Some(PixelData {
+            data: vec![40, 80, 120, 128],
+            width: 1,
+            height: 1,
+        }),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    // Alpha 128 must survive instead of being forced opaque.
+    assert_eq!(reparsed.image_data.unwrap().data, vec![40, 40, 40, 128]);
+}
+
+#[test]
+fn native_16bit_composite_planes_make_resaves_byte_stable() {
+    let psd = Psd {
+        width: 2,
+        height: 1,
+        channels: Some(4),
+        bits_per_channel: Some(16),
+        color_mode: Some(ColorMode::RGB),
+        image_data: Some(PixelData {
+            data: vec![40, 80, 120, 255, 200, 210, 220, 255],
+            width: 2,
+            height: 1,
+        }),
+        ..Default::default()
+    };
+    let first = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(&first), ReadOptions::default()).unwrap();
+    let native = reparsed
+        .composite_native
+        .as_ref()
+        .expect("native planes kept");
+    assert_eq!(native.bits_per_channel, 16);
+    assert_eq!(native.color_mode, ColorMode::RGB);
+    assert_eq!(native.channels.len(), 4);
+    assert!(
+        native.channels.iter().all(|plane| plane.len() == 4),
+        "each plane holds two 16-bit samples"
+    );
+    // An unchanged save reuses the native planes; the file must not drift.
+    let second = write_psd(&reparsed, &WriteOptions::default()).unwrap();
+    assert_eq!(first, second, "unchanged resave should be byte-identical");
+}
+
+#[test]
+fn writing_skipped_composite_is_refused_unless_requested() {
+    let psd = Psd {
+        width: 2,
+        height: 2,
+        channels: Some(3),
+        bits_per_channel: Some(8),
+        color_mode: Some(ColorMode::RGB),
+        image_data: Some(PixelData {
+            data: vec![7u8; 2 * 2 * 4],
+            width: 2,
+            height: 2,
+        }),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let skipped = read_psd(
+        Cursor::new(bytes),
+        ReadOptions {
+            skip_composite_image_data: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(skipped.composite_skipped);
+    let err = write_psd(&skipped, &WriteOptions::default()).unwrap_err();
+    assert!(
+        err.to_string().contains("refusing to synthesize"),
+        "unexpected error: {}",
+        err
+    );
+    // The explicit override allows the write.
+    assert!(write_psd(
+        &skipped,
+        &WriteOptions {
+            overwrite_skipped_composite: Some(true),
+            ..Default::default()
+        }
+    )
+    .is_ok());
+}
+
+#[test]
+fn editing_layer_preview_invalidates_raw_channels() {
+    let psd = Psd {
+        width: 1,
+        height: 1,
+        channels: Some(4),
+        bits_per_channel: Some(16),
+        color_mode: Some(ColorMode::RGB),
+        image_data: Some(PixelData {
+            data: vec![40, 80, 120, 255],
+            width: 1,
+            height: 1,
+        }),
+        children: Some(vec![Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            image_data: Some(PixelData {
+                data: vec![40, 80, 120, 255],
+                width: 1,
+                height: 1,
+            }),
+            ..Default::default()
+        }]),
+        ..Default::default()
+    };
+    let bytes = write_psd(&psd, &WriteOptions::default()).unwrap();
+    let mut reparsed = read_psd(Cursor::new(bytes), ReadOptions::default()).unwrap();
+    let child = reparsed.children.as_mut().unwrap().first_mut().unwrap();
+    assert!(child.raw_data.is_some());
+    // Editing the preview must not be silently ignored in favor of raw bytes.
+    child.image_data.as_mut().unwrap().data = vec![90, 91, 92, 255];
+    let bytes2 = write_psd(&reparsed, &WriteOptions::default()).unwrap();
+    let reparsed2 = read_psd(Cursor::new(bytes2), ReadOptions::default()).unwrap();
+    let child2 = &reparsed2.children.as_ref().unwrap()[0];
+    assert_eq!(
+        child2.image_data.as_ref().unwrap().data,
+        vec![90, 91, 92, 255],
+        "edited preview must be written instead of stale raw channels"
+    );
+}
+
+#[test]
+fn invalidate_text_layers_forces_typed_serialization() {
+    use psd_great::additional_info::{LayerAdditionalInfo, TextLayerData};
+
+    fn text_layer(transform: Vec<f64>, raw: Option<Vec<u8>>) -> Layer {
+        use psd_great::descriptor::DescriptorValue;
+        let mut text_descriptor = psd_great::descriptor::Descriptor {
+            name: String::new(),
+            class_id: "TxLr".to_string(),
+            items: Default::default(),
+        };
+        text_descriptor.items.insert(
+            "Txt ".to_string(),
+            DescriptorValue::Text("hello".to_string()),
+        );
+        Layer {
+            top: Some(0),
+            left: Some(0),
+            bottom: Some(1),
+            right: Some(1),
+            additional_info: LayerAdditionalInfo {
+                name: Some("Text".to_string()),
+                text: Some(TextLayerData {
+                    raw_bytes: raw,
+                    transform,
+                    text: "hello".to_string(),
+                    text_version: 50,
+                    descriptor_version: 16,
+                    text_data: Some(text_descriptor),
+                    warp_version: 1,
+                    warp_descriptor_version: 16,
+                    warp_data: Some(psd_great::descriptor::Descriptor {
+                        name: String::new(),
+                        class_id: "Warp".to_string(),
+                        items: Default::default(),
+                    }),
+                    left: 0,
+                    top: 0,
+                    right: 1,
+                    bottom: 1,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+    fn doc(layer: Layer) -> Psd {
+        Psd {
+            width: 1,
+            height: 1,
+            channels: Some(3),
+            bits_per_channel: Some(8),
+            color_mode: Some(ColorMode::RGB),
+            children: Some(vec![layer]),
+            ..Default::default()
+        }
+    }
+
+    // Baseline: typed-only write produces the canonical TySh payload.
+    let baseline = doc(text_layer(vec![1.0; 6], None));
+    let canonical_bytes = write_psd(&baseline, &WriteOptions::default()).unwrap();
+    let baseline_psd = read_psd(Cursor::new(&canonical_bytes), ReadOptions::default()).unwrap();
+    let canonical_raw = baseline_psd.children.as_ref().unwrap()[0]
+        .additional_info
+        .text
+        .as_ref()
+        .expect("canonical text")
+        .raw_bytes
+        .clone()
+        .expect("canonical raw");
+
+    // A layer loaded with that raw cache and an edited transform.
+    let edited = text_layer(vec![9.0; 6], Some(canonical_raw.clone()));
+
+    // Typed edits invalidate the stale raw cache automatically.
+    let preserved = write_psd(&doc(edited.clone()), &WriteOptions::default()).unwrap();
+    let reparsed = read_psd(Cursor::new(&preserved), ReadOptions::default()).unwrap();
+    let text = reparsed.children.as_ref().unwrap()[0]
+        .additional_info
+        .text
+        .as_ref()
+        .expect("text block");
+    assert_ne!(text.raw_bytes.as_deref(), Some(&canonical_raw[..]));
+    assert_eq!(text.transform, vec![9.0; 6], "typed edit was ignored");
+
+    // With invalidation the typed serialization (with the edited transform)
+    // is written instead.
+    let rewritten = write_psd(
+        &doc(edited),
+        &WriteOptions {
+            invalidate_text_layers: Some(true),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let reparsed = read_psd(Cursor::new(rewritten), ReadOptions::default()).unwrap();
+    let text = reparsed.children.as_ref().unwrap()[0]
+        .additional_info
+        .text
+        .as_ref()
+        .expect("text block");
+    assert_eq!(
+        text.transform,
+        vec![9.0; 6],
+        "typed edit must be serialized"
+    );
+    assert_ne!(
+        text.raw_bytes.as_deref(),
+        Some(&canonical_raw[..]),
+        "stale raw cache must not be reused after invalidation"
+    );
+}
+
+#[test]
+fn skip_thumbnail_option_skips_thumbnail_decode() {
+    // Find any fixture carrying a thumbnail resource and verify the option.
+    let mut exercised = false;
+    for path in sample_fixture_paths() {
+        let bytes = fs::read(&path).unwrap();
+        let default = read_psd(Cursor::new(&bytes), ReadOptions::default()).unwrap();
+        if default
+            .image_resources
+            .as_ref()
+            .and_then(|r| r.thumbnail.as_ref())
+            .is_some()
+        {
+            let skipped = read_psd(
+                Cursor::new(&bytes),
+                ReadOptions {
+                    skip_thumbnail: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                skipped
+                    .image_resources
+                    .as_ref()
+                    .and_then(|r| r.thumbnail.as_ref())
+                    .is_none(),
+                "{}: thumbnail should be skipped",
+                path.display()
+            );
+            assert!(
+                skipped
+                    .image_resources
+                    .as_ref()
+                    .is_some_and(|r| r.thumbnail_skipped),
+                "{}: skipped thumbnail state should be retained",
+                path.display()
+            );
+            exercised = true;
+            break;
+        }
+    }
+    assert!(exercised, "no fixture exercised the thumbnail skip path");
 }
 
 #[test]
@@ -2590,14 +3171,15 @@ fn linked_file_kind_is_typed_publicly() {
         open_descriptor: None,
     };
 
-    assert_eq!(file.data_kind, Some(psd_great::LinkedFileDataKind::External));
+    assert_eq!(
+        file.data_kind,
+        Some(psd_great::LinkedFileDataKind::External)
+    );
 }
 
 #[test]
 fn guide_direction_and_display_units_are_typed_publicly() {
-    use psd_great::psd::{
-        DisplayInfo,
-    };
+    use psd_great::psd::DisplayInfo;
 
     let guide = psd_great::GuideInfo {
         location: 10.0,
